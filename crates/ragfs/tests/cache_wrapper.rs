@@ -451,6 +451,50 @@ async fn cached_tree_traversal_reuses_directory_cache_after_warmup() {
 }
 
 #[tokio::test]
+async fn cached_tree_memoizes_generation_keys_within_one_traversal() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend.mkdir("/docs/sub", 0o755).await.unwrap();
+    backend
+        .write("/docs/one.md", b"one", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    backend
+        .write("/docs/sub/two.md", b"two", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let (fs, provider) = cached_fs_with_tracking_provider(
+        backend,
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    fs.tree_directory("/docs", false, None, None)
+        .await
+        .unwrap();
+    provider.reset_observed_reads();
+
+    let result = fs
+        .tree_directory("/docs", false, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 3);
+    let subtree_keys = provider
+        .observed_read_keys()
+        .into_iter()
+        .filter(|key| key.contains(":subtree:"))
+        .collect::<Vec<_>>();
+    let unique = subtree_keys
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        subtree_keys.len(),
+        unique.len(),
+        "one cached tree traversal should not re-read the same generation key"
+    );
+}
+
+#[tokio::test]
 async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();

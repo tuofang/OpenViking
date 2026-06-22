@@ -122,6 +122,7 @@ impl CachedFileSystem {
 
         let base_path = normalize_prefix_path(path);
         let mut result = Vec::new();
+        let generation_cache = Mutex::new(HashMap::new());
         let mut stack = vec![TreeTask::VisitDir(base_path.clone())];
 
         while let Some(task) = stack.pop() {
@@ -139,7 +140,9 @@ impl CachedFileSystem {
                         }
                     }
 
-                    let entries = self.read_dir(&current_path).await?;
+                    let entries = self
+                        .read_dir_with_generation_cache(&current_path, &generation_cache)
+                        .await?;
                     for entry in entries.into_iter().rev() {
                         let is_hidden_file = !entry.is_dir && entry.name.starts_with('.');
                         if is_hidden_file && !show_hidden {
