@@ -980,6 +980,109 @@ async fn full_file_reads_are_read_through_cached_but_range_reads_bypass() {
 }
 
 #[tokio::test]
+async fn cache_on_v2_binary_objects_preserve_core_api_correctness() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend.mkdir("/docs/sub", 0o755).await.unwrap();
+    backend
+        .write("/docs/one.txt", b"one deployment", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    backend
+        .write("/docs/sub/two.txt", b"two deployment", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let probe = backend.clone();
+    let (fs, provider) = cached_fs_with_policy(
+        backend,
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    assert_eq!(
+        fs.read("/docs/one.txt", 0, 0).await.unwrap(),
+        b"one deployment"
+    );
+    assert_eq!(
+        fs.read("/docs/one.txt", 0, 0).await.unwrap(),
+        b"one deployment"
+    );
+    assert_eq!(probe.read_count(), 1);
+
+    fs.write("/docs/new.txt", b"new deployment", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.read("/docs/new.txt", 0, 0).await.unwrap(),
+        b"new deployment"
+    );
+    assert_eq!(
+        probe.read_count(),
+        1,
+        "full cacheable writes should populate file cache before returning"
+    );
+
+    let names = fs
+        .read_dir("/docs")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"new.txt".to_string()));
+    assert!(names.contains(&"one.txt".to_string()));
+    assert!(names.contains(&"sub".to_string()));
+    assert_eq!(fs.read_dir("/docs").await.unwrap().len(), 3);
+
+    let tree_paths = fs
+        .tree_directory("/docs", false, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    assert!(tree_paths.iter().any(|path| path.ends_with("/one.txt")));
+    assert!(tree_paths.iter().any(|path| path.ends_with("/sub/two.txt")));
+
+    fs.rename("/docs/one.txt", "/docs/renamed.txt")
+        .await
+        .unwrap();
+    assert!(fs.read("/docs/one.txt", 0, 0).await.is_err());
+    assert_eq!(
+        fs.read("/docs/renamed.txt", 0, 0).await.unwrap(),
+        b"one deployment"
+    );
+
+    fs.remove("/docs/new.txt").await.unwrap();
+    let names_after_remove = fs
+        .read_dir("/docs")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    assert!(!names_after_remove.contains(&"new.txt".to_string()));
+    assert!(names_after_remove.contains(&"renamed.txt".to_string()));
+
+    fs.remove_all("/docs/sub").await.unwrap();
+    let tree_after_remove_all = fs
+        .tree_directory("/docs", false, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    assert!(!tree_after_remove_all
+        .iter()
+        .any(|path| path.ends_with("/sub/two.txt")));
+
+    let keys = provider.keys().await;
+    assert!(
+        keys.iter().all(|key| key.starts_with("ragfs:v2:test:")),
+        "all cache objects should use the v2 namespace after the binary codec bump: {keys:?}"
+    );
+}
+
+#[tokio::test]
 async fn read_dir_is_cached_and_parent_changes_invalidate_it() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();

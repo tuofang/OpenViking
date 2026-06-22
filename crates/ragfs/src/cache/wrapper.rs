@@ -960,7 +960,7 @@ impl CachedFileSystem {
     fn object_key(&self, kind: &str, path: &str) -> String {
         let normalized = normalize_path(path);
         format!(
-            "ragfs:v1:{}:{}:{:016x}",
+            "ragfs:v2:{}:{}:{:016x}",
             self.namespace.as_str(),
             kind,
             stable_hash(normalized.as_bytes())

@@ -1366,16 +1366,19 @@ mod tests {
             .await
             .unwrap()
             .expect("file cache object should exist");
-        let envelope: Value = serde_json::from_slice(&encoded).unwrap();
-        let payload = envelope["payload"]["File"]
-            .as_array()
-            .expect("file payload should be a byte array")
-            .iter()
-            .map(|value| value.as_u64().unwrap() as u8)
-            .collect::<Vec<_>>();
         assert!(
-            payload.starts_with(b"OVE1"),
+            encoded.starts_with(b"RGFC\x02"),
+            "cache file objects should use the v2 binary envelope"
+        );
+        assert!(
+            encoded.windows(4).any(|window| window == b"OVE1"),
             "shared cache providers must store encrypted file envelopes"
+        );
+        assert!(
+            !encoded
+                .windows(b"tenant-a-secret".len())
+                .any(|window| window == b"tenant-a-secret"),
+            "shared cache providers must not store plaintext file contents"
         );
     }
 
