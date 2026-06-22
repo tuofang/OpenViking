@@ -30,11 +30,8 @@ struct TrackingProvider {
     inner: MemoryCacheProvider,
     gets: AtomicU64,
     batch_gets: AtomicU64,
-    active_gets: AtomicU64,
-    max_active_gets: AtomicU64,
     seen_get_keys: Mutex<Vec<String>>,
     seen_batch_get_keys: Mutex<Vec<Vec<String>>>,
-    get_delay: Duration,
 }
 
 struct UnavailableProvider;
@@ -53,24 +50,14 @@ impl TrackingProvider {
             inner: MemoryCacheProvider::new(),
             gets: AtomicU64::new(0),
             batch_gets: AtomicU64::new(0),
-            active_gets: AtomicU64::new(0),
-            max_active_gets: AtomicU64::new(0),
             seen_get_keys: Mutex::new(Vec::new()),
             seen_batch_get_keys: Mutex::new(Vec::new()),
-            get_delay: Duration::ZERO,
         }
-    }
-
-    fn with_get_delay(mut self, delay: Duration) -> Self {
-        self.get_delay = delay;
-        self
     }
 
     fn reset_observed_reads(&self) {
         self.gets.store(0, Ordering::Relaxed);
         self.batch_gets.store(0, Ordering::Relaxed);
-        self.active_gets.store(0, Ordering::Relaxed);
-        self.max_active_gets.store(0, Ordering::Relaxed);
         self.seen_get_keys.lock().unwrap().clear();
         self.seen_batch_get_keys.lock().unwrap().clear();
     }
@@ -91,28 +78,12 @@ impl TrackingProvider {
         keys
     }
 
-    fn max_concurrent_gets(&self) -> u64 {
-        self.max_active_gets.load(Ordering::Relaxed)
+    fn observed_get_keys(&self) -> Vec<String> {
+        self.seen_get_keys.lock().unwrap().clone()
     }
 
-    fn enter_get(&self) {
-        let active = self.active_gets.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut current = self.max_active_gets.load(Ordering::Relaxed);
-        while active > current {
-            match self.max_active_gets.compare_exchange_weak(
-                current,
-                active,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    fn exit_get(&self) {
-        self.active_gets.fetch_sub(1, Ordering::Relaxed);
+    fn observed_batch_get_key_batches(&self) -> Vec<Vec<String>> {
+        self.seen_batch_get_keys.lock().unwrap().clone()
     }
 }
 
@@ -150,13 +121,7 @@ impl CacheProvider for TrackingProvider {
     async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
         self.gets.fetch_add(1, Ordering::Relaxed);
         self.seen_get_keys.lock().unwrap().push(key.to_string());
-        self.enter_get();
-        if !self.get_delay.is_zero() {
-            tokio::time::sleep(self.get_delay).await;
-        }
-        let result = self.inner.get(key).await;
-        self.exit_get();
-        result
+        self.inner.get(key).await
     }
 
     async fn put(&self, key: &str, value: Bytes) -> CacheResult<()> {
@@ -468,15 +433,10 @@ async fn cached_tree_memoizes_generation_keys_within_one_traversal() {
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
     );
 
-    fs.tree_directory("/docs", false, None, None)
-        .await
-        .unwrap();
+    fs.tree_directory("/docs", false, None, None).await.unwrap();
     provider.reset_observed_reads();
 
-    let result = fs
-        .tree_directory("/docs", false, None, None)
-        .await
-        .unwrap();
+    let result = fs.tree_directory("/docs", false, None, None).await.unwrap();
 
     assert_eq!(result.len(), 3);
     let subtree_keys = provider
@@ -625,7 +585,55 @@ async fn cached_grep_memoizes_generation_keys_within_one_traversal() {
 }
 
 #[tokio::test]
-async fn cached_grep_scans_cached_files_with_bounded_concurrency() {
+async fn cached_grep_fetches_file_payloads_in_bounded_batches() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    for index in 0..16 {
+        backend
+            .write(
+                &format!("/docs/{index}.md"),
+                b"needle\nplain",
+                0,
+                WriteFlag::Create,
+            )
+            .await
+            .unwrap();
+    }
+    let (fs, provider) = cached_fs_with_tracking_provider(
+        backend,
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    fs.grep("/docs", "needle", true, false, None, None, None)
+        .await
+        .unwrap();
+    provider.reset_observed_reads();
+
+    let result = fs
+        .grep("/docs", "needle", true, false, None, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(result.count, 16);
+    let file_batches = provider
+        .observed_batch_get_key_batches()
+        .into_iter()
+        .filter(|batch| batch.iter().any(|key| key.contains(":file:")))
+        .collect::<Vec<_>>();
+    assert!(
+        file_batches.len() >= 2,
+        "warm cached grep should split file payload reads into bounded batches"
+    );
+    assert!(
+        file_batches
+            .iter()
+            .all(|batch| batch.iter().filter(|key| key.contains(":file:")).count() <= 8),
+        "cached grep file payload batch size should stay bounded"
+    );
+}
+
+#[tokio::test]
+async fn cached_grep_fetches_file_payloads_with_batch_get() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();
     for index in 0..8 {
@@ -639,11 +647,9 @@ async fn cached_grep_scans_cached_files_with_bounded_concurrency() {
             .await
             .unwrap();
     }
-    let provider = Arc::new(TrackingProvider::new().with_get_delay(Duration::from_millis(30)));
-    let (fs, provider) = cached_fs_with_tracking_provider_instance(
+    let (fs, provider) = cached_fs_with_tracking_provider(
         backend,
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
-        provider,
     );
 
     fs.grep("/docs", "needle", true, false, None, None, None)
@@ -657,14 +663,72 @@ async fn cached_grep_scans_cached_files_with_bounded_concurrency() {
         .unwrap();
 
     assert_eq!(result.count, 8);
-    let max_gets = provider.max_concurrent_gets();
+    let file_batches = provider
+        .observed_batch_get_key_batches()
+        .into_iter()
+        .filter(|batch| batch.iter().any(|key| key.contains(":file:")))
+        .collect::<Vec<_>>();
     assert!(
-        max_gets > 1,
-        "warm cached grep should scan cached file reads concurrently"
+        !file_batches.is_empty(),
+        "warm cached grep should fetch cached file payloads with provider batch_get"
     );
     assert!(
-        max_gets <= 8,
-        "cached grep file scan concurrency should stay bounded"
+        provider
+            .observed_get_keys()
+            .into_iter()
+            .all(|key| !key.contains(":file:")),
+        "warm cached grep should not fetch file payloads with single-key get"
+    );
+}
+
+#[tokio::test]
+async fn cached_grep_batches_file_generation_validation_per_payload_batch() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    for index in 0..8 {
+        backend
+            .write(
+                &format!("/docs/{index}.md"),
+                b"needle\nplain",
+                0,
+                WriteFlag::Create,
+            )
+            .await
+            .unwrap();
+    }
+    let (fs, provider) = cached_fs_with_tracking_provider(
+        backend,
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    fs.grep("/docs", "needle", true, false, None, None, None)
+        .await
+        .unwrap();
+    provider.reset_observed_reads();
+
+    let result = fs
+        .grep("/docs", "needle", true, false, None, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(result.count, 8);
+    let generation_batches = provider
+        .observed_batch_get_key_batches()
+        .into_iter()
+        .filter(|batch| batch.iter().any(|key| key.contains(":subtree:")))
+        .collect::<Vec<_>>();
+    assert!(
+        generation_batches
+            .iter()
+            .any(|batch| batch.iter().filter(|key| key.contains(":subtree:")).count() > 3),
+        "warm cached grep should batch generation validation across files in the same payload batch"
+    );
+    assert!(
+        provider
+            .observed_get_keys()
+            .into_iter()
+            .all(|key| !key.contains(":subtree:")),
+        "warm cached grep should not validate file generations with single-key get"
     );
 }
 
