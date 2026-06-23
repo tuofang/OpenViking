@@ -5,24 +5,26 @@ use super::{
     CacheError, CacheMetrics, CachePolicy, CacheProvider, CacheResult, CacheTraversalMode,
 };
 use crate::core::filesystem::{
-    compile_grep_regex, is_excluded_path, normalize_prefix_path, relative_depth,
-    relative_match_file,
+    compile_grep_regex, default_grep_concurrency, grep_bytes, is_excluded_path,
+    normalize_prefix_path, relative_depth, relative_match_file,
 };
 use crate::core::{
-    FileInfo, FileSystem, GrepMatch, GrepResult, MultiWriteWrappedFS, Result, TreeEntry, WriteFlag,
+    FileInfo, FileSystem, GrepResult, MultiWriteWrappedFS, Result, TreeEntry, WriteFlag,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-const GREP_CACHE_FILE_CONCURRENCY: usize = 8;
-const GREP_CACHE_FILE_BATCH_SIZE: usize = GREP_CACHE_FILE_CONCURRENCY;
+fn grep_cache_file_concurrency() -> usize {
+    default_grep_concurrency()
+}
 
 /// Namespace prepended to every provider key owned by one wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +67,18 @@ struct CachedFileCandidate {
     index: usize,
     key: String,
     path: String,
-    envelope: CacheEnvelope,
+    generations: Vec<GenerationSnapshot>,
+    payload: CachedFilePayload,
+}
+
+struct CachedFilePayload {
+    value: Bytes,
+    payload_range: Range<usize>,
+}
+
+enum GrepFileContent {
+    Cached(CachedFilePayload),
+    Owned(Vec<u8>),
 }
 
 enum CachedFileDecode {
@@ -78,6 +91,25 @@ enum CachedFileDecode {
         key: String,
         path: String,
     },
+}
+
+impl CachedFilePayload {
+    fn len(&self) -> usize {
+        self.payload_range.len()
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.value[self.payload_range.clone()]
+    }
+}
+
+impl GrepFileContent {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Cached(payload) => payload.as_bytes(),
+            Self::Owned(data) => data,
+        }
+    }
 }
 
 impl CachedFileSystem {
@@ -287,7 +319,7 @@ impl CachedFileSystem {
                 }
 
                 file_batch.push(current_path);
-                if file_batch.len() >= GREP_CACHE_FILE_BATCH_SIZE {
+                if file_batch.len() >= grep_cache_file_concurrency() {
                     self.flush_grep_file_batch(
                         &mut file_batch,
                         &base_path,
@@ -338,19 +370,19 @@ impl CachedFileSystem {
         let mut indexed = stream::iter(files.into_iter().zip(cached_files).enumerate())
             .map(|(index, (path, cached_content))| async move {
                 let content = match cached_content {
-                    Some(content) => content,
+                    Some(content) => GrepFileContent::Cached(content),
                     None => match self
                         .read_with_generation_cache(&path, 0, 0, generation_cache)
                         .await
                     {
-                        Ok(content) => content,
+                        Ok(content) => GrepFileContent::Owned(content),
                         Err(error) => return (index, Err(error)),
                     },
                 };
-                let matches = Self::grep_content(&content, &path, base_path, re, remaining_limit);
-                (index, matches)
+                let matches = grep_bytes(base_path, &path, content.as_bytes(), re, remaining_limit);
+                (index, Ok(matches))
             })
-            .buffer_unordered(GREP_CACHE_FILE_CONCURRENCY)
+            .buffer_unordered(grep_cache_file_concurrency())
             .collect::<Vec<_>>()
             .await;
 
@@ -366,33 +398,6 @@ impl CachedFileSystem {
         }
 
         Ok(())
-    }
-
-    fn grep_content(
-        content: &[u8],
-        path: &str,
-        base_path: &str,
-        re: &Regex,
-        remaining_limit: usize,
-    ) -> Result<Vec<GrepMatch>> {
-        let content_str = String::from_utf8_lossy(content);
-        let rel_file = relative_match_file(base_path, path);
-        let mut matches = Vec::new();
-
-        for (line_num, line) in content_str.lines().enumerate() {
-            if matches.len() >= remaining_limit {
-                break;
-            }
-            if re.is_match(line) {
-                matches.push(GrepMatch {
-                    file: rel_file.clone(),
-                    line: (line_num + 1) as u64,
-                    content: line.to_string(),
-                });
-            }
-        }
-
-        Ok(matches)
     }
 
     async fn cache_get(&self, key: &str) -> CacheResult<Option<Bytes>> {
@@ -478,52 +483,92 @@ impl CachedFileSystem {
             .any(|scope| is_same_or_descendant(&normalized, scope))
     }
 
+    async fn remember_generation(&self, key: String, value: u64) {
+        self.generations.write().await.insert(key, value);
+    }
+
+    async fn remember_generations<I>(&self, generations: I)
+    where
+        I: IntoIterator<Item = (String, u64)>,
+    {
+        let mut local_generations = self.generations.write().await;
+        for (key, value) in generations {
+            local_generations.insert(key, value);
+        }
+    }
+
     async fn current_generation(&self, key: &str) -> CacheResult<u64> {
         let values = self.current_generations(&[key.to_string()]).await?;
         Ok(values[0])
     }
 
     async fn current_generations(&self, keys: &[String]) -> CacheResult<Vec<u64>> {
-        let provider_values = self.cache_batch_get(keys).await?;
-        let local_generations = self.generations.read().await;
-        let mut values = Vec::with_capacity(keys.len());
-        let mut missing = Vec::new();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        for (key, provider_value) in keys.iter().zip(provider_values) {
-            let value = match provider_value {
-                None => {
-                    let value = local_generations
-                        .get(key)
-                        .copied()
-                        .unwrap_or(self.generation_epoch);
-                    missing.push((key.clone(), value));
-                    value
-                }
-                Some(value) if value.len() == std::mem::size_of::<u64>() => {
-                    let mut bytes = [0_u8; 8];
-                    bytes.copy_from_slice(&value);
-                    u64::from_be_bytes(bytes)
-                }
-                Some(_) => {
-                    return Err(CacheError::InvalidData(format!(
-                        "generation key {key} has invalid length"
-                    )));
-                }
-            };
-            values.push(value);
+        let local_generations = self.generations.read().await;
+        let mut values = vec![None; keys.len()];
+        let mut missing_keys = Vec::new();
+        let mut seen_missing = HashSet::new();
+
+        for (index, key) in keys.iter().enumerate() {
+            if let Some(value) = local_generations.get(key) {
+                values[index] = Some(*value);
+            } else if seen_missing.insert(key.clone()) {
+                missing_keys.push(key.clone());
+            }
         }
         drop(local_generations);
 
-        {
-            let mut local_generations = self.generations.write().await;
-            for (key, value) in keys.iter().zip(values.iter()) {
-                local_generations.insert(key.clone(), *value);
+        if !missing_keys.is_empty() {
+            let provider_values = self.cache_batch_get(&missing_keys).await?;
+            let local_generations = self.generations.read().await;
+            let mut fetched = HashMap::with_capacity(missing_keys.len());
+            let mut missing = Vec::new();
+
+            for (key, provider_value) in missing_keys.iter().zip(provider_values) {
+                let value = match provider_value {
+                    None => {
+                        let value = local_generations
+                            .get(key)
+                            .copied()
+                            .unwrap_or(self.generation_epoch);
+                        missing.push((key.clone(), value));
+                        value
+                    }
+                    Some(value) if value.len() == std::mem::size_of::<u64>() => {
+                        let mut bytes = [0_u8; 8];
+                        bytes.copy_from_slice(&value);
+                        u64::from_be_bytes(bytes)
+                    }
+                    Some(_) => {
+                        return Err(CacheError::InvalidData(format!(
+                            "generation key {key} has invalid length"
+                        )))
+                    }
+                };
+                fetched.insert(key.clone(), value);
+            }
+            drop(local_generations);
+
+            self.remember_generations(fetched.iter().map(|(key, value)| (key.clone(), *value)))
+                .await;
+            self.put_missing_generations(missing).await;
+
+            for (index, key) in keys.iter().enumerate() {
+                if values[index].is_none() {
+                    values[index] = fetched.get(key).copied();
+                }
             }
         }
 
-        self.put_missing_generations(missing).await;
-
-        Ok(values)
+        values
+            .into_iter()
+            .map(|value| {
+                value.ok_or_else(|| CacheError::Internal("missing generation value".to_string()))
+            })
+            .collect()
     }
 
     async fn current_generations_memoized(
@@ -685,7 +730,7 @@ impl CachedFileSystem {
             }
         };
         let next = current.wrapping_add(1);
-        self.generations.write().await.insert(key.clone(), next);
+        self.remember_generation(key.clone(), next).await;
         if self
             .cache_put(&key, Bytes::copy_from_slice(&next.to_be_bytes()), path)
             .await
@@ -758,7 +803,7 @@ impl CachedFileSystem {
         paths: &[String],
         record_hit: bool,
         generation_cache: &Mutex<HashMap<String, u64>>,
-    ) -> Vec<Option<Vec<u8>>> {
+    ) -> Vec<Option<CachedFilePayload>> {
         if paths.is_empty() {
             return Vec::new();
         }
@@ -778,7 +823,7 @@ impl CachedFileSystem {
                 for path in &normalized_paths {
                     self.mark_bypass(path).await;
                 }
-                return vec![None; paths.len()];
+                return (0..paths.len()).map(|_| None).collect();
             }
         };
 
@@ -795,24 +840,29 @@ impl CachedFileSystem {
                     return CachedFileDecode::Missing { index };
                 };
 
-                match CacheEnvelope::decode(&value) {
-                    Ok(envelope) if envelope.matches(CacheObjectKind::File, &path) => {
+                match CacheEnvelope::decode_file_parts(&value) {
+                    Ok(parts) if parts.path() == path => {
+                        let payload_range = parts.payload_range();
                         CachedFileDecode::Hit(CachedFileCandidate {
                             index,
                             key,
                             path,
-                            envelope,
+                            generations: parts.into_generations(),
+                            payload: CachedFilePayload {
+                                value,
+                                payload_range,
+                            },
                         })
                     }
                     _ => CachedFileDecode::Invalid { index, key, path },
                 }
             })
         })
-        .buffer_unordered(GREP_CACHE_FILE_CONCURRENCY)
+        .buffer_unordered(grep_cache_file_concurrency())
         .collect::<Vec<_>>()
         .await;
 
-        let mut result = vec![None; paths.len()];
+        let mut result = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
         let mut candidates = Vec::new();
         for decoded in decoded {
             match decoded {
@@ -837,8 +887,7 @@ impl CachedFileSystem {
             .iter()
             .flat_map(|candidate| {
                 candidate
-                    .envelope
-                    .generations()
+                    .generations
                     .iter()
                     .map(|snapshot| snapshot.key.clone())
             })
@@ -859,25 +908,15 @@ impl CachedFileSystem {
 
         for candidate in candidates {
             let generations_match = candidate
-                .envelope
-                .generations()
+                .generations
                 .iter()
                 .all(|snapshot| generation_values.get(&snapshot.key) == Some(&snapshot.value));
 
             if generations_match {
-                match candidate.envelope.into_file() {
-                    Ok(data) => {
-                        if record_hit {
-                            self.metrics.file_hit(data.len());
-                        }
-                        result[candidate.index] = Some(data);
-                    }
-                    Err(_) => {
-                        self.metrics.error();
-                        self.cache_delete(&candidate.key, &candidate.path).await;
-                        result[candidate.index] = None;
-                    }
+                if record_hit {
+                    self.metrics.file_hit(candidate.payload.len());
                 }
+                result[candidate.index] = Some(candidate.payload);
             } else {
                 self.cache_delete(&candidate.key, &candidate.path).await;
                 result[candidate.index] = None;

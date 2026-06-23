@@ -4,6 +4,7 @@ use super::{CacheError, CacheResult};
 use crate::core::FileInfo;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CACHE_ENVELOPE_MAGIC: &[u8; 4] = b"RGFC";
@@ -36,6 +37,48 @@ pub(crate) struct CacheEnvelope {
     path: String,
     generations: Vec<GenerationSnapshot>,
     payload: CachePayload,
+}
+
+#[cfg(test)]
+pub(crate) struct FileEnvelopeView<'a> {
+    path: String,
+    generations: Vec<GenerationSnapshot>,
+    payload: &'a [u8],
+}
+
+pub(crate) struct FileEnvelopeParts {
+    path: String,
+    generations: Vec<GenerationSnapshot>,
+    payload_range: Range<usize>,
+}
+
+#[cfg(test)]
+impl<'a> FileEnvelopeView<'a> {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn generations(&self) -> &[GenerationSnapshot] {
+        &self.generations
+    }
+
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+}
+
+impl FileEnvelopeParts {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn into_generations(self) -> Vec<GenerationSnapshot> {
+        self.generations
+    }
+
+    pub fn payload_range(&self) -> Range<usize> {
+        self.payload_range.clone()
+    }
 }
 
 impl CacheEnvelope {
@@ -142,6 +185,69 @@ impl CacheEnvelope {
             path,
             generations,
             payload,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn decode_file_view(value: &[u8]) -> CacheResult<FileEnvelopeView<'_>> {
+        let parts = Self::decode_file_parts(value)?;
+        Ok(FileEnvelopeView {
+            path: parts.path,
+            generations: parts.generations,
+            payload: &value[parts.payload_range],
+        })
+    }
+
+    pub fn decode_file_parts(value: &[u8]) -> CacheResult<FileEnvelopeParts> {
+        let mut reader = BinaryReader::new(value);
+        let magic = reader.read_bytes(CACHE_ENVELOPE_MAGIC.len())?;
+        if magic != CACHE_ENVELOPE_MAGIC {
+            return Err(CacheError::InvalidData(
+                "invalid envelope magic".to_string(),
+            ));
+        }
+        let version = reader.read_u8()?;
+        if version != CACHE_ENVELOPE_VERSION {
+            return Err(CacheError::InvalidData(format!(
+                "unsupported envelope version {version}"
+            )));
+        }
+        let kind = match reader.read_u8()? {
+            KIND_FILE => CacheObjectKind::File,
+            KIND_DIRECTORY => CacheObjectKind::Directory,
+            other => {
+                return Err(CacheError::InvalidData(format!(
+                    "unsupported envelope kind {other}"
+                )))
+            }
+        };
+        if kind != CacheObjectKind::File {
+            return Err(CacheError::InvalidData(
+                "expected file envelope".to_string(),
+            ));
+        }
+        let path = reader.read_string()?;
+        let generation_count = reader.read_u32()? as usize;
+        let mut generations = Vec::with_capacity(generation_count);
+        for _ in 0..generation_count {
+            generations.push(GenerationSnapshot {
+                key: reader.read_string()?,
+                value: reader.read_u64()?,
+            });
+        }
+        let payload_len = reader.read_u64()? as usize;
+        let payload_start = reader.position();
+        reader.read_bytes(payload_len)?;
+        let payload_end = reader.position();
+        if !reader.is_finished() {
+            return Err(CacheError::InvalidData(
+                "trailing bytes in cache envelope".to_string(),
+            ));
+        }
+        Ok(FileEnvelopeParts {
+            path,
+            generations,
+            payload_range: payload_start..payload_end,
         })
     }
 
@@ -286,6 +392,10 @@ impl<'a> BinaryReader<'a> {
         self.position == self.value.len()
     }
 
+    fn position(&self) -> usize {
+        self.position
+    }
+
     fn read_bytes(&mut self, len: usize) -> CacheResult<&'a [u8]> {
         let end = self
             .position
@@ -367,6 +477,34 @@ mod tests {
                 .into_file()
                 .unwrap(),
             data
+        );
+    }
+
+    #[test]
+    fn file_envelope_view_borrows_payload_without_copying() {
+        let data = b"borrowed file payload".to_vec();
+        let envelope = CacheEnvelope::file(
+            "/docs/a.txt".to_string(),
+            data.clone(),
+            vec![GenerationSnapshot {
+                key: "ragfs:v2:test:subtree:0000000000000001".to_string(),
+                value: 42,
+            }],
+        );
+
+        let encoded = envelope.encode().unwrap();
+        let view = CacheEnvelope::decode_file_view(&encoded).unwrap();
+
+        assert_eq!(view.path(), "/docs/a.txt");
+        assert_eq!(view.generations()[0].value, 42);
+        assert_eq!(view.payload(), data.as_slice());
+
+        let encoded_start = encoded.as_ptr() as usize;
+        let encoded_end = encoded_start + encoded.len();
+        let payload_ptr = view.payload().as_ptr() as usize;
+        assert!(
+            (encoded_start..encoded_end).contains(&payload_ptr),
+            "file view payload should borrow from the encoded envelope buffer"
         );
     }
 }

@@ -9,6 +9,8 @@ use regex::Regex;
 use std::any::Any;
 
 use super::errors::{Error, Result};
+#[cfg(any(feature = "cache", feature = "s3"))]
+use super::types::GrepMatch;
 use super::types::{FileInfo, GrepResult, TreeEntry, WriteFlag};
 
 /// Normalize a path for prefix comparisons.
@@ -87,6 +89,63 @@ pub(crate) fn compile_grep_regex(pattern: &str, case_insensitive: bool) -> Resul
     };
     Regex::new(&regex_pattern)
         .map_err(|e| Error::invalid_operation(format!("Invalid regex pattern: {}", e)))
+}
+
+/// Default file-level concurrency window for grep implementations.
+#[cfg(any(feature = "cache", feature = "s3"))]
+pub(crate) fn default_grep_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() * 2).clamp(16, 100))
+        .unwrap_or(16)
+}
+
+/// Scan complete text lines and append matches, updating the caller's line counter.
+#[cfg(any(feature = "cache", feature = "s3"))]
+pub(crate) fn grep_text_lines(
+    rel_file: &str,
+    text: &str,
+    re: &Regex,
+    remaining_limit: usize,
+    line_no: &mut u64,
+    matches: &mut Vec<GrepMatch>,
+) {
+    for line in text.lines() {
+        if matches.len() >= remaining_limit {
+            break;
+        }
+        *line_no += 1;
+        if re.is_match(line) {
+            matches.push(GrepMatch {
+                file: rel_file.to_string(),
+                line: *line_no,
+                content: line.to_string(),
+            });
+        }
+    }
+}
+
+/// Scan a full in-memory file payload using the same line semantics as grep streams.
+#[cfg(feature = "cache")]
+pub(crate) fn grep_bytes(
+    base_path: &str,
+    path: &str,
+    content: &[u8],
+    re: &Regex,
+    remaining_limit: usize,
+) -> Vec<GrepMatch> {
+    let content_str = String::from_utf8_lossy(content);
+    let rel_file = relative_match_file(base_path, path);
+    let mut line_no = 0;
+    let mut matches = Vec::new();
+    grep_text_lines(
+        &rel_file,
+        &content_str,
+        re,
+        remaining_limit,
+        &mut line_no,
+        &mut matches,
+    );
+    matches
 }
 
 /// Core filesystem abstraction trait

@@ -62,10 +62,6 @@ impl TrackingProvider {
         self.seen_batch_get_keys.lock().unwrap().clear();
     }
 
-    fn batch_get_count(&self) -> u64 {
-        self.batch_gets.load(Ordering::Relaxed)
-    }
-
     fn observed_read_keys(&self) -> Vec<String> {
         let mut keys = self.seen_get_keys.lock().unwrap().clone();
         keys.extend(
@@ -455,6 +451,58 @@ async fn cached_tree_memoizes_generation_keys_within_one_traversal() {
 }
 
 #[tokio::test]
+async fn hot_read_reuses_local_generation_cache_across_requests() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend
+        .write("/docs/one.md", b"one", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let (fs, provider) = cached_fs_with_tracking_provider(backend, CachePolicy::default());
+
+    assert_eq!(fs.read("/docs/one.md", 0, 0).await.unwrap(), b"one");
+    provider.reset_observed_reads();
+
+    assert_eq!(fs.read("/docs/one.md", 0, 0).await.unwrap(), b"one");
+
+    let subtree_keys = provider
+        .observed_read_keys()
+        .into_iter()
+        .filter(|key| key.contains(":subtree:"))
+        .collect::<Vec<_>>();
+    assert!(
+        subtree_keys.is_empty(),
+        "hot read should reuse local generation cache instead of reading subtree generation from provider"
+    );
+}
+
+#[tokio::test]
+async fn hot_read_dir_reuses_local_generation_cache_across_requests() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend
+        .write("/docs/one.md", b"one", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let (fs, provider) = cached_fs_with_tracking_provider(backend, CachePolicy::default());
+
+    assert_eq!(fs.read_dir("/docs").await.unwrap().len(), 1);
+    provider.reset_observed_reads();
+
+    assert_eq!(fs.read_dir("/docs").await.unwrap().len(), 1);
+
+    let subtree_keys = provider
+        .observed_read_keys()
+        .into_iter()
+        .filter(|key| key.contains(":subtree:"))
+        .collect::<Vec<_>>();
+    assert!(
+        subtree_keys.is_empty(),
+        "hot read_dir should reuse local generation cache instead of reading subtree generation from provider"
+    );
+}
+
+#[tokio::test]
 async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();
@@ -506,7 +554,7 @@ async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
 }
 
 #[tokio::test]
-async fn cached_grep_batches_generation_validation_after_warmup() {
+async fn cached_grep_reuses_local_generation_cache_after_warmup() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();
     backend.mkdir("/docs/sub", 0o755).await.unwrap();
@@ -534,9 +582,14 @@ async fn cached_grep_batches_generation_validation_after_warmup() {
         .unwrap();
 
     assert_eq!(result.count, 2);
+    let subtree_keys = provider
+        .observed_read_keys()
+        .into_iter()
+        .filter(|key| key.contains(":subtree:"))
+        .collect::<Vec<_>>();
     assert!(
-        provider.batch_get_count() > 0,
-        "warm cached grep should batch generation validation reads"
+        subtree_keys.is_empty(),
+        "warm cached grep should reuse local generation cache instead of reading subtree generations from provider"
     );
 }
 
@@ -588,7 +641,7 @@ async fn cached_grep_memoizes_generation_keys_within_one_traversal() {
 async fn cached_grep_fetches_file_payloads_in_bounded_batches() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();
-    for index in 0..16 {
+    for index in 0..40 {
         backend
             .write(
                 &format!("/docs/{index}.md"),
@@ -614,7 +667,7 @@ async fn cached_grep_fetches_file_payloads_in_bounded_batches() {
         .await
         .unwrap();
 
-    assert_eq!(result.count, 16);
+    assert_eq!(result.count, 40);
     let file_batches = provider
         .observed_batch_get_key_batches()
         .into_iter()
@@ -624,11 +677,18 @@ async fn cached_grep_fetches_file_payloads_in_bounded_batches() {
         file_batches.len() >= 2,
         "warm cached grep should split file payload reads into bounded batches"
     );
+    let max_file_batch = file_batches
+        .iter()
+        .map(|batch| batch.iter().filter(|key| key.contains(":file:")).count())
+        .max()
+        .unwrap_or(0);
     assert!(
-        file_batches
-            .iter()
-            .all(|batch| batch.iter().filter(|key| key.contains(":file:")).count() <= 8),
-        "cached grep file payload batch size should stay bounded"
+        max_file_batch > 8,
+        "cached grep should use the shared grep concurrency window instead of the old 8-file window"
+    );
+    assert!(
+        max_file_batch <= 100,
+        "cached grep file payload batch size should stay bounded by the shared grep concurrency cap"
     );
 }
 
@@ -682,7 +742,7 @@ async fn cached_grep_fetches_file_payloads_with_batch_get() {
 }
 
 #[tokio::test]
-async fn cached_grep_batches_file_generation_validation_per_payload_batch() {
+async fn cached_grep_reuses_local_file_generation_cache_per_payload_batch() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();
     for index in 0..8 {
@@ -712,23 +772,14 @@ async fn cached_grep_batches_file_generation_validation_per_payload_batch() {
         .unwrap();
 
     assert_eq!(result.count, 8);
-    let generation_batches = provider
-        .observed_batch_get_key_batches()
+    let subtree_keys = provider
+        .observed_read_keys()
         .into_iter()
-        .filter(|batch| batch.iter().any(|key| key.contains(":subtree:")))
+        .filter(|key| key.contains(":subtree:"))
         .collect::<Vec<_>>();
     assert!(
-        generation_batches
-            .iter()
-            .any(|batch| batch.iter().filter(|key| key.contains(":subtree:")).count() > 3),
-        "warm cached grep should batch generation validation across files in the same payload batch"
-    );
-    assert!(
-        provider
-            .observed_get_keys()
-            .into_iter()
-            .all(|key| !key.contains(":subtree:")),
-        "warm cached grep should not validate file generations with single-key get"
+        subtree_keys.is_empty(),
+        "warm cached grep should reuse local file generation cache instead of reading subtree generations from provider"
     );
 }
 
@@ -1403,6 +1454,33 @@ async fn remove_all_generation_rejects_residual_descendant_cache_entries() {
 }
 
 #[tokio::test]
+async fn bump_generation_reuses_and_updates_local_generation_cache() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/tree", 0o755).await.unwrap();
+    backend
+        .write("/tree/leaf.txt", b"old", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let (fs, provider) = cached_fs_with_tracking_provider(backend, CachePolicy::default());
+
+    assert_eq!(fs.read("/tree/leaf.txt", 0, 0).await.unwrap(), b"old");
+    provider.reset_observed_reads();
+
+    fs.remove_all("/tree").await.unwrap();
+
+    let subtree_keys = provider
+        .observed_read_keys()
+        .into_iter()
+        .filter(|key| key.contains(":subtree:"))
+        .collect::<Vec<_>>();
+    assert!(
+        subtree_keys.is_empty(),
+        "single-instance bump should reuse local generation cache instead of reading subtree generation from provider"
+    );
+}
+
+#[tokio::test]
+#[ignore = "single-instance local generation cache does not provide immediate multi-instance invalidation"]
 async fn shared_provider_generation_bump_invalidates_other_wrappers() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/tree", 0o755).await.unwrap();

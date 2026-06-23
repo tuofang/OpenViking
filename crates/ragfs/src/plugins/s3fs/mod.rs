@@ -27,7 +27,10 @@ use futures::stream::{self, StreamExt};
 use regex::Regex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::core::filesystem::{relative_depth, relative_match_file};
+use crate::core::filesystem::{
+    default_grep_concurrency as shared_default_grep_concurrency, grep_text_lines, relative_depth,
+    relative_match_file,
+};
 use crate::core::{
     ConfigParameter, Error, FileInfo, FileSystem, GrepMatch, GrepResult, PluginConfig, Result,
     ServicePlugin, TreeEntry, WriteFlag,
@@ -126,19 +129,14 @@ async fn grep_stream(
             (merged, chunk_str[complete_end..].to_string())
         };
 
-        for line in text.lines() {
-            if matches.len() >= remaining_limit {
-                break;
-            }
-            line_no += 1;
-            if re.is_match(line) {
-                matches.push(GrepMatch {
-                    file: rel_file.to_string(),
-                    line: line_no,
-                    content: line.to_string(),
-                });
-            }
-        }
+        grep_text_lines(
+            rel_file,
+            &text,
+            re,
+            remaining_limit,
+            &mut line_no,
+            &mut matches,
+        );
 
         partial.push_str(&remainder);
 
@@ -149,14 +147,14 @@ async fn grep_stream(
     }
 
     if !partial.is_empty() && matches.len() < remaining_limit {
-        line_no += 1;
-        if re.is_match(&partial) {
-            matches.push(GrepMatch {
-                file: rel_file.to_string(),
-                line: line_no,
-                content: partial,
-            });
-        }
+        grep_text_lines(
+            rel_file,
+            &partial,
+            re,
+            remaining_limit,
+            &mut line_no,
+            &mut matches,
+        );
     }
 
     Ok(matches)
@@ -254,9 +252,7 @@ impl S3FileSystem {
 
     /// Default concurrency window for parallel grep.
     fn default_grep_concurrency() -> usize {
-        std::thread::available_parallelism()
-            .map(|n| (n.get() * 2).clamp(16, 100))
-            .unwrap_or(16)
+        shared_default_grep_concurrency()
     }
 
     /// Stream a single file in fixed-size chunks, match lines against `re`,
