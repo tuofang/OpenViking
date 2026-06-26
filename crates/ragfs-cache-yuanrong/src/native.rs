@@ -5,7 +5,6 @@ use sha2::{Digest, Sha256};
 use std::ffi::{CStr, CString};
 use std::ptr::{self, NonNull};
 use std::slice;
-use std::sync::Arc;
 use std::time::Duration;
 
 struct NativeYuanrongStore {
@@ -290,10 +289,29 @@ impl YuanrongProvider {
         .map_err(|error| CacheError::Internal(format!("Yuanrong connection task failed: {error}")))?
         .map_err(map_cache_error)?;
 
-        // A native provider currently owns one native client handle. The C++
-        // bridge serializes SDK calls on that handle, so sdk_concurrency only
-        // bounds Rust blocking tasks here; it is not backend concurrency.
-        Self::from_store(config, Arc::new(store)).await
+        let mut stores = Vec::with_capacity(config.sdk_concurrency);
+        stores.push(std::sync::Arc::new(store) as std::sync::Arc<dyn YuanrongKvStore>);
+        for _ in 1..config.sdk_concurrency {
+            let setup_config = config.clone();
+            let store = tokio::time::timeout(
+                setup_timeout,
+                tokio::task::spawn_blocking(move || NativeYuanrongStore::connect(&setup_config)),
+            )
+            .await
+            .map_err(|_| {
+                CacheError::Timeout(format!(
+                    "Yuanrong connection exceeded {} ms",
+                    setup_timeout.as_millis()
+                ))
+            })?
+            .map_err(|error| {
+                CacheError::Internal(format!("Yuanrong connection task failed: {error}"))
+            })?
+            .map_err(map_cache_error)?;
+            stores.push(std::sync::Arc::new(store) as std::sync::Arc<dyn YuanrongKvStore>);
+        }
+
+        Self::from_stores(config, stores).await
     }
 }
 

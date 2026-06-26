@@ -30,13 +30,25 @@ impl YuanrongProvider {
         config: YuanrongConfig,
         store: Arc<dyn YuanrongKvStore>,
     ) -> CacheResult<Self> {
+        Self::from_stores(config, vec![store]).await
+    }
+
+    pub(crate) async fn from_stores(
+        config: YuanrongConfig,
+        stores: Vec<Arc<dyn YuanrongKvStore>>,
+    ) -> CacheResult<Self> {
         config.validate()?;
+        if stores.is_empty() {
+            return Err(CacheError::InvalidArgument(
+                "Yuanrong provider requires at least one KV store".into(),
+            ));
+        }
         let client = Arc::new(YuanrongClient::new(
-            store,
+            stores,
             config.sdk_concurrency,
             Duration::from_millis(config.request_timeout_ms),
         ));
-        client.health_check().await?;
+        client.health_check_all().await?;
         Ok(Self {
             client,
             known_keys: Mutex::new(HashSet::new()),
