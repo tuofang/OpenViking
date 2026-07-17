@@ -30,6 +30,7 @@ enum CacheProviderKind {
     Yuanrong,
     Mooncake,
     Redis,
+    MemStore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,7 @@ struct RagfsCacheConfig {
     yuanrong: YuanrongCacheConfig,
     mooncake: MooncakeCacheConfig,
     redis: RedisCacheConfig,
+    memstore: MemStoreCacheConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,24 @@ struct RedisCacheConfig {
     read_from_replica: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemStoreCacheConfig {
+    net_connect_count: u16,
+    net_group_count: u16,
+    busy_polling: bool,
+    sdk_concurrency: usize,
+    operation_timeout_ms: u64,
+    max_value_size_bytes: usize,
+    tls_enabled: bool,
+    certification_path: String,
+    ca_cert_path: String,
+    ca_crl_path: String,
+    private_key_path: String,
+    private_key_password_path: String,
+    decrypter_lib_path: String,
+    openssl_lib_dir: String,
+}
+
 impl Default for RagfsCacheConfig {
     fn default() -> Self {
         Self {
@@ -94,6 +114,7 @@ impl Default for RagfsCacheConfig {
             yuanrong: YuanrongCacheConfig::default(),
             mooncake: MooncakeCacheConfig::default(),
             redis: RedisCacheConfig::default(),
+            memstore: MemStoreCacheConfig::default(),
         }
     }
 }
@@ -144,6 +165,27 @@ impl Default for RedisCacheConfig {
     }
 }
 
+impl Default for MemStoreCacheConfig {
+    fn default() -> Self {
+        Self {
+            net_connect_count: 16,
+            net_group_count: 1,
+            busy_polling: true,
+            sdk_concurrency: 16,
+            operation_timeout_ms: 5_000,
+            max_value_size_bytes: 67_108_864,
+            tls_enabled: false,
+            certification_path: String::new(),
+            ca_cert_path: String::new(),
+            ca_crl_path: String::new(),
+            private_key_path: String::new(),
+            private_key_password_path: String::new(),
+            decrypter_lib_path: String::new(),
+            openssl_lib_dir: String::new(),
+        }
+    }
+}
+
 struct CacheProviderFactory;
 
 impl CacheProviderFactory {
@@ -153,6 +195,7 @@ impl CacheProviderFactory {
             CacheProviderKind::Yuanrong => create_yuanrong_provider(config).await,
             CacheProviderKind::Mooncake => create_mooncake_provider(config).await,
             CacheProviderKind::Redis => create_redis_provider(config).await,
+            CacheProviderKind::MemStore => create_memstore_provider(config).await,
         }
     }
 }
@@ -238,6 +281,41 @@ async fn create_redis_provider(config: &RagfsCacheConfig) -> CacheResult<Arc<dyn
 async fn create_redis_provider(_config: &RagfsCacheConfig) -> CacheResult<Arc<dyn CacheProvider>> {
     Err(CacheError::Unavailable(
         "Redis support requires the cache-redis feature".to_string(),
+    ))
+}
+
+#[cfg(feature = "memstore-native")]
+async fn create_memstore_provider(
+    config: &RagfsCacheConfig,
+) -> CacheResult<Arc<dyn CacheProvider>> {
+    use ragfs_cache_memstore::{MemStoreConfig, MemStoreProvider};
+
+    let provider = MemStoreProvider::connect(MemStoreConfig {
+        net_connect_count: config.memstore.net_connect_count,
+        net_group_count: config.memstore.net_group_count,
+        busy_polling: config.memstore.busy_polling,
+        sdk_concurrency: config.memstore.sdk_concurrency,
+        operation_timeout_ms: config.memstore.operation_timeout_ms,
+        max_value_size_bytes: config.memstore.max_value_size_bytes,
+        tls_enabled: config.memstore.tls_enabled,
+        certification_path: config.memstore.certification_path.clone(),
+        ca_cert_path: config.memstore.ca_cert_path.clone(),
+        ca_crl_path: config.memstore.ca_crl_path.clone(),
+        private_key_path: config.memstore.private_key_path.clone(),
+        private_key_password_path: config.memstore.private_key_password_path.clone(),
+        decrypter_lib_path: config.memstore.decrypter_lib_path.clone(),
+        openssl_lib_dir: config.memstore.openssl_lib_dir.clone(),
+    })
+    .await?;
+    Ok(Arc::new(provider))
+}
+
+#[cfg(not(feature = "memstore-native"))]
+async fn create_memstore_provider(
+    _config: &RagfsCacheConfig,
+) -> CacheResult<Arc<dyn CacheProvider>> {
+    Err(CacheError::Unavailable(
+        "MemStore support requires the memstore-native feature".to_string(),
     ))
 }
 
@@ -362,6 +440,64 @@ fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig
             bool_field(redis, "read_from_replica", config.redis.read_from_replica)?;
     }
 
+    if let Some(memstore) = cache.get("memstore") {
+        let memstore = memstore
+            .as_object()
+            .ok_or_else(|| "storage.agfs.cache.memstore must be an object".to_string())?;
+        config.memstore.net_connect_count = u16_field(
+            memstore,
+            "net_connect_count",
+            config.memstore.net_connect_count,
+        )?;
+        config.memstore.net_group_count =
+            u16_field(memstore, "net_group_count", config.memstore.net_group_count)?;
+        config.memstore.busy_polling =
+            bool_field(memstore, "busy_polling", config.memstore.busy_polling)?;
+        config.memstore.sdk_concurrency =
+            usize_field(memstore, "sdk_concurrency", config.memstore.sdk_concurrency)?;
+        config.memstore.operation_timeout_ms = u64_field(
+            memstore,
+            "operation_timeout_ms",
+            config.memstore.operation_timeout_ms,
+        )?;
+        config.memstore.max_value_size_bytes = usize_field(
+            memstore,
+            "max_value_size_bytes",
+            config.memstore.max_value_size_bytes,
+        )?;
+        config.memstore.tls_enabled =
+            bool_field(memstore, "tls_enabled", config.memstore.tls_enabled)?;
+        config.memstore.certification_path = string_field(
+            memstore,
+            "certification_path",
+            &config.memstore.certification_path,
+        )?;
+        config.memstore.ca_cert_path =
+            string_field(memstore, "ca_cert_path", &config.memstore.ca_cert_path)?;
+        config.memstore.ca_crl_path =
+            string_field(memstore, "ca_crl_path", &config.memstore.ca_crl_path)?;
+        config.memstore.private_key_path = string_field(
+            memstore,
+            "private_key_path",
+            &config.memstore.private_key_path,
+        )?;
+        config.memstore.private_key_password_path = string_field(
+            memstore,
+            "private_key_password_path",
+            &config.memstore.private_key_password_path,
+        )?;
+        config.memstore.decrypter_lib_path = string_field(
+            memstore,
+            "decrypter_lib_path",
+            &config.memstore.decrypter_lib_path,
+        )?;
+        config.memstore.openssl_lib_dir = string_field(
+            memstore,
+            "openssl_lib_dir",
+            &config.memstore.openssl_lib_dir,
+        )?;
+    }
+
     Ok(config)
 }
 
@@ -371,8 +507,9 @@ fn provider_kind(value: String) -> Result<CacheProviderKind, String> {
         "yuanrong" => Ok(CacheProviderKind::Yuanrong),
         "mooncake" => Ok(CacheProviderKind::Mooncake),
         "redis" => Ok(CacheProviderKind::Redis),
+        "memstore" => Ok(CacheProviderKind::MemStore),
         other => Err(format!(
-            "unsupported storage.agfs.cache.provider: {other}; expected memory, yuanrong, mooncake, or redis"
+            "unsupported storage.agfs.cache.provider: {other}; expected memory, redis, yuanrong, mooncake, or memstore"
         )),
     }
 }
@@ -1820,6 +1957,125 @@ mod tests {
         assert!(!cache_config.redis.read_from_replica);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn memstore_cache_config_is_parsed_from_ov_conf() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-memstore-cache-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "storage": {
+                    "agfs": {
+                        "cache": {
+                            "enabled": true,
+                            "provider": "memstore",
+                            "memstore": {
+                                "net_connect_count": 8,
+                                "net_group_count": 2,
+                                "busy_polling": false,
+                                "sdk_concurrency": 32,
+                                "operation_timeout_ms": 7000,
+                                "max_value_size_bytes": 33554432,
+                                "tls_enabled": true,
+                                "certification_path": "/tls/client.crt",
+                                "ca_cert_path": "/tls/ca.crt",
+                                "ca_crl_path": "/tls/ca.crl",
+                                "private_key_path": "/tls/client.key",
+                                "private_key_password_path": "/tls/password",
+                                "decrypter_lib_path": "/tls/decrypter.so",
+                                "openssl_lib_dir": "/tls/openssl"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
+
+        assert!(cache_config.enabled);
+        assert_eq!(cache_config.provider, CacheProviderKind::MemStore);
+        assert_eq!(cache_config.memstore.net_connect_count, 8);
+        assert_eq!(cache_config.memstore.net_group_count, 2);
+        assert!(!cache_config.memstore.busy_polling);
+        assert_eq!(cache_config.memstore.sdk_concurrency, 32);
+        assert_eq!(cache_config.memstore.operation_timeout_ms, 7000);
+        assert_eq!(cache_config.memstore.max_value_size_bytes, 33_554_432);
+        assert!(cache_config.memstore.tls_enabled);
+        assert_eq!(cache_config.memstore.certification_path, "/tls/client.crt");
+        assert_eq!(cache_config.memstore.ca_cert_path, "/tls/ca.crt");
+        assert_eq!(cache_config.memstore.ca_crl_path, "/tls/ca.crl");
+        assert_eq!(cache_config.memstore.private_key_path, "/tls/client.key");
+        assert_eq!(
+            cache_config.memstore.private_key_password_path,
+            "/tls/password"
+        );
+        assert_eq!(
+            cache_config.memstore.decrypter_lib_path,
+            "/tls/decrypter.so"
+        );
+        assert_eq!(cache_config.memstore.openssl_lib_dir, "/tls/openssl");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn memstore_cache_config_uses_exact_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-memstore-cache-defaults-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"storage": {"agfs": {"cache": {"provider": "memstore"}}}}"#,
+        )
+        .unwrap();
+
+        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(cache_config.provider, CacheProviderKind::MemStore);
+        assert_eq!(cache_config.memstore.net_connect_count, 16);
+        assert_eq!(cache_config.memstore.net_group_count, 1);
+        assert!(cache_config.memstore.busy_polling);
+        assert_eq!(cache_config.memstore.sdk_concurrency, 16);
+        assert_eq!(cache_config.memstore.operation_timeout_ms, 5000);
+        assert_eq!(cache_config.memstore.max_value_size_bytes, 67_108_864);
+        assert!(!cache_config.memstore.tls_enabled);
+        assert_eq!(cache_config.memstore.certification_path, "");
+        assert_eq!(cache_config.memstore.ca_cert_path, "");
+        assert_eq!(cache_config.memstore.ca_crl_path, "");
+        assert_eq!(cache_config.memstore.private_key_path, "");
+        assert_eq!(cache_config.memstore.private_key_password_path, "");
+        assert_eq!(cache_config.memstore.decrypter_lib_path, "");
+        assert_eq!(cache_config.memstore.openssl_lib_dir, "");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(not(feature = "memstore-native"))]
+    #[tokio::test]
+    async fn memstore_provider_requires_memstore_native_feature() {
+        let config = RagfsCacheConfig {
+            enabled: true,
+            provider: CacheProviderKind::MemStore,
+            ..RagfsCacheConfig::default()
+        };
+
+        let error = match CacheProviderFactory::create(&config).await {
+            Ok(provider) => panic!("unexpected provider: {}", provider.name()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            CacheError::Unavailable(message)
+                if message == "MemStore support requires the memstore-native feature"
+        ));
     }
 
     #[cfg(not(feature = "cache-redis"))]

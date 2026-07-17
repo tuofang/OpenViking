@@ -154,6 +154,7 @@ class AGFSCacheProvider(str, Enum):
     YUANRONG = "yuanrong"
     MOONCAKE = "mooncake"
     REDIS = "redis"
+    MEMSTORE = "memstore"
 
 
 class AGFSCacheTraversalMode(str, Enum):
@@ -273,6 +274,55 @@ class RedisCacheConfig(BaseModel):
         return self
 
 
+class MemStoreCacheConfig(BaseModel):
+    """Configuration for MemStore cache provider."""
+
+    net_connect_count: int = Field(default=16, description="MemStore connections per channel")
+    net_group_count: int = Field(default=1, description="MemStore IPC worker group count")
+    busy_polling: bool = Field(default=True, description="Enable MemStore client busy polling")
+    sdk_concurrency: int = Field(default=16, description="MemStore SDK concurrency")
+    operation_timeout_ms: int = Field(default=5000, description="MemStore operation timeout")
+    max_value_size_bytes: int = Field(default=64 << 20, description="Maximum MemStore value size")
+    tls_enabled: bool = Field(default=False, description="Enable MemStore client TLS")
+    certification_path: str = Field(default="", description="MemStore client certificate path")
+    ca_cert_path: str = Field(default="", description="MemStore CA certificate path")
+    ca_crl_path: str = Field(default="", description="MemStore CA CRL path")
+    private_key_path: str = Field(default="", description="MemStore private key path")
+    private_key_password_path: str = Field(
+        default="", description="MemStore private key password path"
+    )
+    decrypter_lib_path: str = Field(default="", description="MemStore decrypter library path")
+    openssl_lib_dir: str = Field(default="", description="MemStore OpenSSL library directory")
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_config(self):
+        if self.net_connect_count <= 0 or self.net_connect_count > 65535:
+            raise ValueError("memstore net_connect_count must be between 1 and 65535")
+        if self.net_group_count <= 0 or self.net_group_count > 65535:
+            raise ValueError("memstore net_group_count must be between 1 and 65535")
+        if self.sdk_concurrency <= 0 or self.sdk_concurrency > 0xFFFFFFFF:
+            raise ValueError("memstore sdk_concurrency must be between 1 and 4294967295")
+        if self.operation_timeout_ms <= 0:
+            raise ValueError("memstore operation_timeout_ms must be > 0")
+        if self.max_value_size_bytes <= 0 or self.max_value_size_bytes > 0xFFFFFFFF - 9:
+            raise ValueError("memstore max_value_size_bytes exceeds the framed C value limit")
+        if self.tls_enabled:
+            paths = (
+                self.certification_path,
+                self.ca_cert_path,
+                self.ca_crl_path,
+                self.private_key_path,
+                self.private_key_password_path,
+                self.decrypter_lib_path,
+                self.openssl_lib_dir,
+            )
+            if any(not path for path in paths):
+                raise ValueError("memstore TLS paths are required when TLS is enabled")
+        return self
+
+
 class AGFSCacheConfig(BaseModel):
     """Configuration for optional RAGFS cache layer."""
 
@@ -297,6 +347,7 @@ class AGFSCacheConfig(BaseModel):
     yuanrong: YuanrongCacheConfig = Field(default_factory=YuanrongCacheConfig)
     mooncake: MooncakeCacheConfig = Field(default_factory=MooncakeCacheConfig)
     redis: RedisCacheConfig = Field(default_factory=RedisCacheConfig)
+    memstore: MemStoreCacheConfig = Field(default_factory=MemStoreCacheConfig)
 
     model_config = {"extra": "forbid"}
 

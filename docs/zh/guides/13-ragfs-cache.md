@@ -69,13 +69,15 @@ openviking-server
 | `redis` | 快速落地、普通网络环境 | 当前支持 standalone；建议只从 primary 读取 |
 | `yuanrong` | 近计算缓存、共享内存或异构多级缓存 | 需要 Yuanrong worker 和 native feature |
 | `mooncake` | 远程内存池、RDMA/TCP 数据面 | 需要 Mooncake 服务和 native feature |
+| `memstore` | 同机共享内存缓存 | 需要外部本地 `mmsd`、MemStore SDK 和 native feature |
 
 如果运行包没有编译对应 Provider，启动时会返回类似 “requires the ... feature” 的错误。
 
 ## 原生 Provider 构建
 
-标准 OpenViking wheel 适用于 `memory` 和 `redis` Provider。`yuanrong` 和
-`mooncake` Provider 依赖平台相关的原生 SDK，需要针对目标部署环境单独构建。
+标准 OpenViking wheel 适用于 `memory` 和 `redis` Provider。`yuanrong`、
+`mooncake` 和 `memstore` Provider 依赖平台相关的原生 SDK，需要针对目标部署
+环境单独构建。
 
 先安装 wheel 构建工具：
 
@@ -107,6 +109,41 @@ python -m pip install --force-reinstall target/wheels/ragfs_python-*.whl
 
 OpenViking 启动时，`storage.agfs.cache.yuanrong` 配置的 Yuanrong worker
 必须可用。
+
+### MemStore
+
+MemStore 与 OpenViking 分开部署在同一主机上。请自行启动和配置外部本地
+`mmsd`；OpenViking 不负责启动、停止或管理该 daemon。OpenViking 链接
+所选的 MemStore client library（默认为 `libmms_client.so`），并通过 SDK 的
+SHM client path 与 `mmsd` 通信。`memstore-native` feature 仅支持 Linux。
+
+安装 MemStore C SDK，并导出头文件和库目录：
+
+```bash
+export MEMSTORE_SDK_INCLUDE=/path/to/memstore/include
+export MEMSTORE_SDK_LIB_DIR=/path/to/memstore/lib
+# 可选的链接及运行时库 basename，默认值为 "mms_client"。
+export MEMSTORE_SDK_LIB_NAME=mms_client
+export LD_LIBRARY_PATH="$MEMSTORE_SDK_LIB_DIR:${LD_LIBRARY_PATH:-}"
+```
+
+`MEMSTORE_SDK_LIB_NAME` 决定链接和运行时使用的库 basename。例如，
+`mms_client` 对应 `libmms_client.so`。`mms_client` 只是默认值；自定义 basename
+必须对应 `MEMSTORE_SDK_LIB_DIR` 及运行时库路径中的共享库。
+
+构建并安装 wheel：
+
+```bash
+maturin build --locked --release \
+  --manifest-path crates/ragfs-python-memstore/Cargo.toml \
+  --features memstore-native
+
+python -m pip install --force-reinstall target/wheels/ragfs_python-*.whl
+```
+
+该专用 manifest 只在现有默认 features 上增加 `memstore-native`，不会解析或
+下载 Yuanrong、Mooncake 依赖。OpenViking 运行时仍需在 `LD_LIBRARY_PATH` 中保留
+`MEMSTORE_SDK_LIB_DIR`，以便动态加载器找到所选的 client library。
 
 ### Mooncake
 
@@ -172,7 +209,7 @@ find /tmp/ragfs-python-wheel -name 'libasan*'
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `enabled` | bool | `false` | 是否启用 RAGFS 缓存 |
-| `provider` | str | `"memory"` | `memory`、`redis`、`yuanrong` 或 `mooncake` |
+| `provider` | str | `"memory"` | `memory`、`redis`、`yuanrong`、`mooncake` 或 `memstore` |
 | `namespace` | str | `"openviking"` | 缓存命名空间，用于隔离不同部署或租户 |
 | `max_file_size_bytes` | int | `1048576` | 允许进入缓存的最大完整文件大小 |
 | `bypass_prefixes` | list[str] | `[]` | 强制绕过缓存的路径前缀 |
@@ -191,6 +228,47 @@ Redis 配置：
 | `key_prefix` | `"ragfs-cache"` | Redis 侧 key 前缀 |
 | `default_ttl_seconds` | `3600` | 默认 TTL；`0` 表示不设置 TTL |
 | `read_from_replica` | `false` | standalone 模式下必须为 `false` |
+
+MemStore 配置（以下列出全部默认值）：
+
+```json
+{
+  "storage": {
+    "agfs": {
+      "cache": {
+        "enabled": true,
+        "provider": "memstore",
+        "memstore": {
+          "net_connect_count": 16,
+          "net_group_count": 1,
+          "busy_polling": true,
+          "sdk_concurrency": 16,
+          "operation_timeout_ms": 5000,
+          "max_value_size_bytes": 67108864,
+          "tls_enabled": false,
+          "certification_path": "",
+          "ca_cert_path": "",
+          "ca_crl_path": "",
+          "private_key_path": "",
+          "private_key_password_path": "",
+          "decrypter_lib_path": "",
+          "openssl_lib_dir": ""
+        }
+      }
+    }
+  }
+}
+```
+
+`net_group_count` 表示 IPC worker group 的数量，不是单个 group 内的 worker
+数量；它必须与本地 `mmsd` 配置中 `mms.net.ipc.worker.groups` 的 group 数量
+一致。
+
+MemStore client runtime 是进程全局资源。同一个 OpenViking 进程中的 Provider
+必须使用相同的原生初始化配置。最后一个 Provider 关闭并调用 `MmsExit` 后，
+该 runtime 会永久关闭；再次连接前必须重启 OpenViking 进程。如果 wheel 未启用
+对应 feature，选择 `memstore` 会返回
+`MemStore support requires the memstore-native feature`。
 
 Yuanrong 配置：
 
@@ -254,7 +332,7 @@ RAGFS 将缓存拆成两层：
 OpenViking
   -> RAGFS / MountableFS
   -> CachedFileSystem
-       |-> CacheProvider -> Memory / Redis / Yuanrong / Mooncake
+       |-> CacheProvider -> Memory / Redis / Yuanrong / Mooncake / MemStore
        `-> Backend FileSystem
 ```
 

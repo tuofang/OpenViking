@@ -1,13 +1,17 @@
+[workspace]
+resolver = "2"
+
 [package]
 name = "ragfs-python"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.91.1"
-description = "Python bindings for RAGFS - Rust AGFS filesystem"
+description = "Python bindings for RAGFS with the MemStore native cache provider"
 publish = false
 
 [lib]
 name = "ragfs_python"
+path = "../ragfs-python/src/lib.rs"
 crate-type = ["cdylib"]
 
 [features]
@@ -15,10 +19,15 @@ default = ["extension-module", "s3", "cache-redis"]
 extension-module = ["pyo3/extension-module"]
 s3 = ["ragfs/s3"]
 cache-redis = ["ragfs-cache-redis"]
+memstore-native = [
+    "ragfs-cache-memstore",
+    "ragfs-cache-memstore/memstore-native",
+]
 
 [dependencies]
 ragfs = { path = "../ragfs", features = ["cache"] }
 ragfs-cache-redis = { path = "../ragfs-cache-redis", optional = true }
+ragfs-cache-memstore = { path = "../ragfs-cache-memstore", optional = true }
 pyo3 = { version = "0.27", features = ["abi3", "abi3-py310"] }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1.0"

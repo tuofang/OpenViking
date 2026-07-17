@@ -9,7 +9,10 @@ exclude = [
     "crates/ragfs-cache-mooncake",
     "crates/ragfs-cache-yuanrong",
     "crates/ragfs-cache-yuanrong-sys",
+    "crates/ragfs-cache-memstore-sys",
+    "crates/ragfs-cache-memstore",
     "crates/ragfs-python-native",
+    "crates/ragfs-python-memstore",
 ]
 resolver = "2"
 

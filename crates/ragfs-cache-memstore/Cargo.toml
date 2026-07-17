@@ -1,0 +1,24 @@
+[package]
+name = "ragfs-cache-memstore"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91.1"
+license = "Apache-2.0"
+description = "MemStore cache provider adapter for RAGFS"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1.5"
+libc = "0.2"
+ragfs = { path = "../ragfs", features = ["cache"] }
+ragfs-cache-memstore-sys = { path = "../ragfs-cache-memstore-sys", optional = true }
+sha2 = "0.10"
+thiserror = "1.0"
+tokio = { version = "1.38", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[features]
+default = []
+memstore-native = [
+    "dep:ragfs-cache-memstore-sys",
+    "ragfs-cache-memstore-sys/native",
+]

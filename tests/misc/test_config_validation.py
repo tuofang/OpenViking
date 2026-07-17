@@ -222,6 +222,39 @@ def test_agfs_cache_accepts_redis_provider_config():
     assert config.cache.redis.default_ttl_seconds == 3600
 
 
+def test_agfs_cache_accepts_memstore_provider_config():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        cache={
+            "enabled": True,
+            "provider": "memstore",
+            "namespace": "ov-test",
+            "traversal_mode": "cached_traversal",
+            "memstore": {
+                "net_connect_count": 16,
+                "net_group_count": 1,
+                "busy_polling": True,
+                "sdk_concurrency": 16,
+                "operation_timeout_ms": 5000,
+                "max_value_size_bytes": 67108864,
+                "tls_enabled": False,
+            },
+        },
+    )
+
+    assert config.cache.enabled is True
+    assert config.cache.provider == "memstore"
+    assert config.cache.namespace == "ov-test"
+    assert config.cache.traversal_mode == "cached_traversal"
+    assert config.cache.memstore.net_connect_count == 16
+    assert config.cache.memstore.net_group_count == 1
+    assert config.cache.memstore.busy_polling is True
+    assert config.cache.memstore.sdk_concurrency == 16
+    assert config.cache.memstore.max_value_size_bytes == 67108864
+    assert config.cache.memstore.tls_enabled is False
+
+
 def test_agfs_cache_rejects_invalid_provider():
     with pytest.raises(ValueError, match="provider"):
         AGFSConfig(

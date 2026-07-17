@@ -1,0 +1,15 @@
+[package]
+name = "ragfs-cache-memstore-sys"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91.1"
+license = "Apache-2.0"
+links = "openviking_memstore"
+build = "build.rs"
+
+[features]
+default = []
+native = []
+
+[dependencies]
+libc = "0.2"

@@ -69,14 +69,16 @@ Available Providers:
 | `redis` | Fast rollout on standard networks | Currently supports standalone; read from primary only |
 | `yuanrong` | Near-compute cache, shared memory, or heterogeneous multi-tier cache | Requires Yuanrong worker and native feature |
 | `mooncake` | Remote memory pool, RDMA/TCP data plane | Requires Mooncake services and native feature |
+| `memstore` | Same-host shared-memory cache | Requires an external local `mmsd`, MemStore SDK, and native feature |
 
 If the runtime package was not compiled with the selected Provider, startup returns an error similar to "requires the ... feature".
 
 ## Native Provider Builds
 
 The standard OpenViking wheel is suitable for the `memory` and `redis`
-Providers. The `yuanrong` and `mooncake` Providers depend on platform-specific
-native SDKs and must be built for the target deployment environment.
+Providers. The `yuanrong`, `mooncake`, and `memstore` Providers depend on
+platform-specific native SDKs and must be built for the target deployment
+environment.
 
 Install the wheel builder first:
 
@@ -109,6 +111,46 @@ python -m pip install --force-reinstall target/wheels/ragfs_python-*.whl
 
 The Yuanrong worker configured by `storage.agfs.cache.yuanrong` must be
 available when OpenViking starts.
+
+### MemStore
+
+MemStore is deployed separately on the same host. Start and configure the
+external local `mmsd` yourself; OpenViking does not start, stop, or manage this
+daemon. OpenViking links the selected MemStore client library
+(`libmms_client.so` by default) and uses the SDK's SHM client path to
+communicate with `mmsd`. The `memstore-native` feature is supported only on
+Linux.
+
+Install the MemStore C SDK and export its header and library locations:
+
+```bash
+export MEMSTORE_SDK_INCLUDE=/path/to/memstore/include
+export MEMSTORE_SDK_LIB_DIR=/path/to/memstore/lib
+# Optional linked/runtime library basename; defaults to "mms_client".
+export MEMSTORE_SDK_LIB_NAME=mms_client
+export LD_LIBRARY_PATH="$MEMSTORE_SDK_LIB_DIR:${LD_LIBRARY_PATH:-}"
+```
+
+`MEMSTORE_SDK_LIB_NAME` selects the basename used at link time and runtime:
+for example, `mms_client` selects `libmms_client.so`. `mms_client` is only the
+default; a custom basename must identify the corresponding shared library in
+`MEMSTORE_SDK_LIB_DIR` and on the runtime library path.
+
+Build and install the wheel:
+
+```bash
+maturin build --locked --release \
+  --manifest-path crates/ragfs-python-memstore/Cargo.toml \
+  --features memstore-native
+
+python -m pip install --force-reinstall target/wheels/ragfs_python-*.whl
+```
+
+The dedicated manifest adds only `memstore-native` to the existing default
+features and does not resolve or download Yuanrong or Mooncake dependencies.
+Keep `MEMSTORE_SDK_LIB_DIR` on
+`LD_LIBRARY_PATH` when OpenViking runs so the loader can find the selected
+client library.
 
 ### Mooncake
 
@@ -177,7 +219,7 @@ Both checks should produce no output.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable the RAGFS cache |
-| `provider` | str | `"memory"` | `memory`, `redis`, `yuanrong`, or `mooncake` |
+| `provider` | str | `"memory"` | `memory`, `redis`, `yuanrong`, `mooncake`, or `memstore` |
 | `namespace` | str | `"openviking"` | Cache namespace for isolating deployments or tenants |
 | `max_file_size_bytes` | int | `1048576` | Maximum full-file object size admitted to cache |
 | `bypass_prefixes` | list[str] | `[]` | Path prefixes that always bypass cache |
@@ -196,6 +238,48 @@ Redis configuration:
 | `key_prefix` | `"ragfs-cache"` | Redis-side key prefix |
 | `default_ttl_seconds` | `3600` | Default TTL; `0` means no TTL |
 | `read_from_replica` | `false` | Must be `false` in standalone mode |
+
+MemStore configuration with all defaults shown:
+
+```json
+{
+  "storage": {
+    "agfs": {
+      "cache": {
+        "enabled": true,
+        "provider": "memstore",
+        "memstore": {
+          "net_connect_count": 16,
+          "net_group_count": 1,
+          "busy_polling": true,
+          "sdk_concurrency": 16,
+          "operation_timeout_ms": 5000,
+          "max_value_size_bytes": 67108864,
+          "tls_enabled": false,
+          "certification_path": "",
+          "ca_cert_path": "",
+          "ca_crl_path": "",
+          "private_key_path": "",
+          "private_key_password_path": "",
+          "decrypter_lib_path": "",
+          "openssl_lib_dir": ""
+        }
+      }
+    }
+  }
+}
+```
+
+`net_group_count` is the number of IPC worker groups, not the number of
+workers within one group. It must match the group count in
+`mms.net.ipc.worker.groups` for the local `mmsd` configuration.
+
+The MemStore client runtime is process-global. Providers in one OpenViking
+process must use the same native initialization settings. After the final
+Provider closes and calls `MmsExit`, the runtime is permanently closed; restart
+the OpenViking process before connecting again. If the wheel lacks the feature,
+selecting `memstore` returns
+`MemStore support requires the memstore-native feature`.
 
 Yuanrong configuration:
 
@@ -259,7 +343,7 @@ Call flow:
 OpenViking
   -> RAGFS / MountableFS
   -> CachedFileSystem
-       |-> CacheProvider -> Memory / Redis / Yuanrong / Mooncake
+       |-> CacheProvider -> Memory / Redis / Yuanrong / Mooncake / MemStore
        `-> Backend FileSystem
 ```
 
