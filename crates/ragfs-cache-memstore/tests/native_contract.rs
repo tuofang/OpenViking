@@ -23,6 +23,12 @@ const RESIZE_EXHAUSTION_KEY: &str = "resize-exhaustion";
 const UNSET_OK_KEY: &str = "unset-overall-ok";
 const ITEM_EPERM_KEY: &str = "item-eperm";
 const ITEM_ERROR_KEY: &str = "item-error";
+const SMALL_KEY: &str = "small";
+const LARGE_KEY: &str = "large";
+const INITIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
+const SMALL_PAYLOAD_SIZE: usize = 1024;
+const LARGE_PAYLOAD_SIZE: usize = 5000;
+const GROWN_PAYLOAD_SIZE: usize = 5 * 1024;
 const ZERO_COPY_FRAME: &[u8] = b"OVMS\x01\x00\x00\x00\x01z";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +43,8 @@ struct ObservedOptions {
 #[derive(Default)]
 struct FakeMemStore {
     values: HashMap<String, Vec<u8>>,
-    growing_header_sent: bool,
+    growing_initial_read: bool,
+    get_calls: Vec<Vec<(String, usize)>>,
     initialize_calls: usize,
     successful_initializations: usize,
     exit_calls: usize,
@@ -139,6 +146,12 @@ unsafe extern "C" fn MmsReplace(items: *mut ReplaceItems, item_num: c_uint) -> i
 unsafe extern "C" fn MmsGet(items: *mut GetItems, item_num: c_uint) -> i32 {
     let mut store = fake_store().lock().unwrap();
     let items = slice::from_raw_parts_mut(items, item_num as usize);
+    store.get_calls.push(
+        items
+            .iter()
+            .map(|item| (key_from_raw(item.key, item.key_len), item.length as usize))
+            .collect(),
+    );
     if items.len() == 1 {
         let key = key_from_raw(items[0].key, items[0].key_len);
         if key == SENTINEL_KEY {
@@ -173,14 +186,19 @@ unsafe extern "C" fn MmsGet(items: *mut GetItems, item_num: c_uint) -> i32 {
             *item.result = RET_MMS_ERROR;
             continue;
         }
-        let Some(mut value) = store.values.get(&key).cloned() else {
+        let Some(value) = store.values.get(&key).cloned() else {
             *item.real_length = 0;
             *item.result = RET_MMS_NOT_FOUND;
             continue;
         };
-        if key == GROWING_KEY && !store.growing_header_sent && item.length == 9 {
-            value = frame(b"x");
-            store.growing_header_sent = true;
+        if key == GROWING_KEY
+            && !store.growing_initial_read
+            && item.length as usize == INITIAL_READ_BUFFER_SIZE
+        {
+            store
+                .values
+                .insert(key.clone(), frame(&vec![b'g'; GROWN_PAYLOAD_SIZE]));
+            store.growing_initial_read = true;
         }
         let copied = usize::min(item.length as usize, value.len());
         std::ptr::copy_nonoverlapping(value.as_ptr(), (*item.value).cast::<u8>(), copied);
@@ -219,7 +237,7 @@ fn config() -> MemStoreConfig {
     MemStoreConfig {
         sdk_concurrency: 2,
         operation_timeout_ms: 500,
-        max_value_size_bytes: 1_024,
+        max_value_size_bytes: 8 * 1_024,
         ..MemStoreConfig::default()
     }
 }
@@ -231,7 +249,7 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
     state.next_initialize_result = Some(RET_MMS_NOT_READY);
     state.values.insert(
         GROWING_KEY.into(),
-        frame(b"a value that grew after the header read"),
+        frame(&vec![b'i'; INITIAL_READ_BUFFER_SIZE]),
     );
     drop(state);
 
@@ -287,6 +305,46 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
     }
 
     first
+        .put(SMALL_KEY, Bytes::from(vec![b's'; SMALL_PAYLOAD_SIZE]))
+        .await
+        .unwrap();
+    first
+        .put(LARGE_KEY, Bytes::from(vec![b'l'; LARGE_PAYLOAD_SIZE]))
+        .await
+        .unwrap();
+    fake_store().lock().unwrap().get_calls.clear();
+    assert_eq!(
+        first
+            .batch_get(&[SMALL_KEY.into(), LARGE_KEY.into()])
+            .await
+            .unwrap(),
+        vec![
+            Some(Bytes::from(vec![b's'; SMALL_PAYLOAD_SIZE])),
+            Some(Bytes::from(vec![b'l'; LARGE_PAYLOAD_SIZE])),
+        ]
+    );
+    assert_eq!(
+        fake_store().lock().unwrap().get_calls,
+        vec![
+            vec![
+                (SMALL_KEY.into(), INITIAL_READ_BUFFER_SIZE),
+                (LARGE_KEY.into(), INITIAL_READ_BUFFER_SIZE),
+            ],
+            vec![(LARGE_KEY.into(), 9 + LARGE_PAYLOAD_SIZE)],
+        ]
+    );
+
+    fake_store().lock().unwrap().get_calls.clear();
+    assert_eq!(
+        first.get(SMALL_KEY).await.unwrap(),
+        Some(Bytes::from(vec![b's'; SMALL_PAYLOAD_SIZE]))
+    );
+    assert_eq!(
+        fake_store().lock().unwrap().get_calls,
+        vec![vec![(SMALL_KEY.into(), INITIAL_READ_BUFFER_SIZE)]]
+    );
+
+    first
         .put(
             "shorter",
             Bytes::from_static(b"a much longer original value"),
@@ -298,9 +356,14 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         .await
         .unwrap();
     assert!(first.exists("shorter").await.unwrap());
+    fake_store().lock().unwrap().get_calls.clear();
     assert_eq!(
         first.get("shorter").await.unwrap(),
         Some(Bytes::from_static(b"new"))
+    );
+    assert_eq!(
+        fake_store().lock().unwrap().get_calls,
+        vec![vec![("shorter".into(), INITIAL_READ_BUFFER_SIZE)]]
     );
 
     first
@@ -322,9 +385,7 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         first.batch_get(&keys).await.unwrap(),
         vec![
             Some(Bytes::from_static(b"new")),
-            Some(Bytes::from_static(
-                b"a value that grew after the header read"
-            )),
+            Some(Bytes::from(vec![b'g'; GROWN_PAYLOAD_SIZE])),
             None,
         ]
     );

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const RESULT_SENTINEL: i32 = i32::MIN;
 const HEALTH_KEY: &str = "ovms:health:reserved-never-written:v1";
+const INITIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
 const MAX_RESIZE_ATTEMPTS: usize = 3;
 
 static SERVICEABLE: AtomicBool = AtomicBool::new(false);
@@ -188,40 +189,18 @@ impl NativeMemStore {
             return Ok(Vec::new());
         }
         let native_keys = Self::native_keys(keys)?;
-        let header_sizes = vec![HEADER_LEN; native_keys.len()];
-        let (header_overall, header_reads) = Self::raw_get(&native_keys, &header_sizes)?;
         let mut outcomes = std::iter::repeat_with(|| None)
             .take(keys.len())
             .collect::<Vec<Option<MemStoreItemResult<Option<Vec<u8>>>>>>();
-        let mut pending = Vec::new();
-
-        for (index, read) in header_reads.into_iter().enumerate() {
-            match effective_result(read.result, header_overall, "header get") {
-                Ok(sys::RET_MMS_OK | sys::RET_MMS_READ_EXCEED) => {
-                    if !read.caller_buffer_preserved {
-                        outcomes[index] = Some(Err(zero_copy_error("header get")));
-                    } else if read.real_length < HEADER_LEN {
-                        outcomes[index] = Some(Err(MemStoreStoreError::InvalidData(
-                            "MemStore header read returned fewer than 9 bytes".into(),
-                        )));
-                    } else {
-                        match payload_len(&read.buffer, self.max_value_size) {
-                            Ok(payload_size) => pending.push(PendingRead {
-                                index,
-                                buffer_size: HEADER_LEN + payload_size,
-                                resize_attempts: 0,
-                            }),
-                            Err(error) => outcomes[index] = Some(Err(error)),
-                        }
-                    }
-                }
-                Ok(sys::RET_MMS_NOT_FOUND | sys::RET_MMS_MISS) => {
-                    outcomes[index] = Some(Ok(None));
-                }
-                Ok(code) => outcomes[index] = Some(Err(map_native_status(code, "header get"))),
-                Err(error) => outcomes[index] = Some(Err(error)),
-            }
-        }
+        let max_frame_size = HEADER_LEN + self.max_value_size;
+        let initial_buffer_size = INITIAL_READ_BUFFER_SIZE.min(max_frame_size);
+        let mut pending = (0..native_keys.len())
+            .map(|index| PendingRead {
+                index,
+                buffer_size: initial_buffer_size,
+                resize_attempts: 0,
+            })
+            .collect::<Vec<_>>();
 
         while !pending.is_empty() {
             let call_keys = pending
@@ -236,13 +215,13 @@ impl NativeMemStore {
             let mut retries = Vec::new();
 
             for (item, read) in pending.into_iter().zip(reads) {
-                match effective_result(read.result, overall, "full get") {
+                match effective_result(read.result, overall, "get") {
                     Ok(sys::RET_MMS_NOT_FOUND | sys::RET_MMS_MISS) => {
                         outcomes[item.index] = Some(Ok(None));
                     }
                     Ok(sys::RET_MMS_OK | sys::RET_MMS_READ_EXCEED) => {
                         if !read.caller_buffer_preserved {
-                            outcomes[item.index] = Some(Err(zero_copy_error("full get")));
+                            outcomes[item.index] = Some(Err(zero_copy_error("get")));
                             continue;
                         }
                         let current_payload = match payload_len(&read.buffer, self.max_value_size) {
@@ -267,7 +246,7 @@ impl NativeMemStore {
                             }
                         } else if read.real_length < required_size {
                             outcomes[item.index] = Some(Err(MemStoreStoreError::InvalidData(
-                                "MemStore full read returned a truncated frame".into(),
+                                "MemStore get returned a truncated frame".into(),
                             )));
                         } else {
                             outcomes[item.index] =
@@ -275,7 +254,7 @@ impl NativeMemStore {
                         }
                     }
                     Ok(code) => {
-                        outcomes[item.index] = Some(Err(map_native_status(code, "full get")));
+                        outcomes[item.index] = Some(Err(map_native_status(code, "get")));
                     }
                     Err(error) => outcomes[item.index] = Some(Err(error)),
                 }
