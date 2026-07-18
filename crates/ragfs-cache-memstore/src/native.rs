@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 const RESULT_SENTINEL: i32 = i32::MIN;
 const HEALTH_KEY: &str = "ovms:health:reserved-never-written:v1";
 const INITIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
+const MAX_READ_BATCH_SIZE: usize = 256;
 const MAX_RESIZE_ATTEMPTS: usize = 3;
 
 static SERVICEABLE: AtomicBool = AtomicBool::new(false);
@@ -203,60 +204,66 @@ impl NativeMemStore {
             .collect::<Vec<_>>();
 
         while !pending.is_empty() {
-            let call_keys = pending
-                .iter()
-                .map(|item| native_keys[item.index].clone())
-                .collect::<Vec<_>>();
-            let call_sizes = pending
-                .iter()
-                .map(|item| item.buffer_size)
-                .collect::<Vec<_>>();
-            let (overall, reads) = Self::raw_get(&call_keys, &call_sizes)?;
             let mut retries = Vec::new();
 
-            for (item, read) in pending.into_iter().zip(reads) {
-                match effective_result(read.result, overall, "get") {
-                    Ok(sys::RET_MMS_NOT_FOUND | sys::RET_MMS_MISS) => {
-                        outcomes[item.index] = Some(Ok(None));
-                    }
-                    Ok(sys::RET_MMS_OK | sys::RET_MMS_READ_EXCEED) => {
-                        if !read.caller_buffer_preserved {
-                            outcomes[item.index] = Some(Err(zero_copy_error("get")));
-                            continue;
+            for chunk in pending.chunks(MAX_READ_BATCH_SIZE) {
+                let call_keys = chunk
+                    .iter()
+                    .map(|item| native_keys[item.index].clone())
+                    .collect::<Vec<_>>();
+                let call_sizes = chunk
+                    .iter()
+                    .map(|item| item.buffer_size)
+                    .collect::<Vec<_>>();
+                let (overall, reads) = Self::raw_get(&call_keys, &call_sizes)?;
+
+                for (item, read) in chunk.iter().zip(reads) {
+                    match effective_result(read.result, overall, "get") {
+                        Ok(sys::RET_MMS_NOT_FOUND | sys::RET_MMS_MISS) => {
+                            outcomes[item.index] = Some(Ok(None));
                         }
-                        let current_payload = match payload_len(&read.buffer, self.max_value_size) {
-                            Ok(payload_size) => payload_size,
-                            Err(error) => {
-                                outcomes[item.index] = Some(Err(error));
+                        Ok(sys::RET_MMS_OK | sys::RET_MMS_READ_EXCEED) => {
+                            if !read.caller_buffer_preserved {
+                                outcomes[item.index] = Some(Err(zero_copy_error("get")));
                                 continue;
                             }
-                        };
-                        let required_size = HEADER_LEN + current_payload;
-                        if required_size > item.buffer_size {
-                            if item.resize_attempts < MAX_RESIZE_ATTEMPTS {
-                                retries.push(PendingRead {
-                                    index: item.index,
-                                    buffer_size: required_size,
-                                    resize_attempts: item.resize_attempts + 1,
-                                });
-                            } else {
-                                outcomes[item.index] = Some(Err(MemStoreStoreError::Unavailable(
-                                    "MemStore value kept growing during 3 resize attempts".into(),
+                            let current_payload =
+                                match payload_len(&read.buffer, self.max_value_size) {
+                                    Ok(payload_size) => payload_size,
+                                    Err(error) => {
+                                        outcomes[item.index] = Some(Err(error));
+                                        continue;
+                                    }
+                                };
+                            let required_size = HEADER_LEN + current_payload;
+                            if required_size > item.buffer_size {
+                                if item.resize_attempts < MAX_RESIZE_ATTEMPTS {
+                                    retries.push(PendingRead {
+                                        index: item.index,
+                                        buffer_size: required_size,
+                                        resize_attempts: item.resize_attempts + 1,
+                                    });
+                                } else {
+                                    outcomes[item.index] =
+                                        Some(Err(MemStoreStoreError::Unavailable(
+                                            "MemStore value kept growing during 3 resize attempts"
+                                                .into(),
+                                        )));
+                                }
+                            } else if read.real_length < required_size {
+                                outcomes[item.index] = Some(Err(MemStoreStoreError::InvalidData(
+                                    "MemStore get returned a truncated frame".into(),
                                 )));
+                            } else {
+                                outcomes[item.index] =
+                                    Some(decode_value(&read.buffer, self.max_value_size).map(Some));
                             }
-                        } else if read.real_length < required_size {
-                            outcomes[item.index] = Some(Err(MemStoreStoreError::InvalidData(
-                                "MemStore get returned a truncated frame".into(),
-                            )));
-                        } else {
-                            outcomes[item.index] =
-                                Some(decode_value(&read.buffer, self.max_value_size).map(Some));
                         }
+                        Ok(code) => {
+                            outcomes[item.index] = Some(Err(map_native_status(code, "get")));
+                        }
+                        Err(error) => outcomes[item.index] = Some(Err(error)),
                     }
-                    Ok(code) => {
-                        outcomes[item.index] = Some(Err(map_native_status(code, "get")));
-                    }
-                    Err(error) => outcomes[item.index] = Some(Err(error)),
                 }
             }
             pending = retries;

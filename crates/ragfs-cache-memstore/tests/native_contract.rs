@@ -25,11 +25,15 @@ const ITEM_EPERM_KEY: &str = "item-eperm";
 const ITEM_ERROR_KEY: &str = "item-error";
 const SMALL_KEY: &str = "small";
 const LARGE_KEY: &str = "large";
+const EMPTY_KEY: &str = "empty";
+const TRUNCATED_KEY: &str = "truncated";
 const INITIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
+const MAX_READ_BATCH_SIZE: usize = 256;
 const SMALL_PAYLOAD_SIZE: usize = 1024;
 const LARGE_PAYLOAD_SIZE: usize = 5000;
 const GROWN_PAYLOAD_SIZE: usize = 5 * 1024;
 const ZERO_COPY_FRAME: &[u8] = b"OVMS\x01\x00\x00\x00\x01z";
+const TRUNCATED_FRAME: &[u8] = b"OVMS\x01\x00\x00\x00\x04data";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedOptions {
@@ -55,6 +59,10 @@ struct FakeMemStore {
 fn fake_store() -> &'static Mutex<FakeMemStore> {
     static STORE: OnceLock<Mutex<FakeMemStore>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(FakeMemStore::default()))
+}
+
+fn take_get_calls() -> Vec<Vec<(String, usize)>> {
+    std::mem::take(&mut fake_store().lock().unwrap().get_calls)
 }
 
 unsafe fn key_from_raw(key: *const c_char, key_len: u16) -> String {
@@ -165,6 +173,16 @@ unsafe extern "C" fn MmsGet(items: *mut GetItems, item_num: c_uint) -> i32 {
             *item.value = ZERO_COPY_FRAME.as_ptr().cast::<c_char>().cast_mut();
             *item.real_length = ZERO_COPY_FRAME.len() as c_uint;
             *item.result = RET_MMS_READ_EXCEED;
+            continue;
+        }
+        if key == TRUNCATED_KEY {
+            std::ptr::copy_nonoverlapping(
+                TRUNCATED_FRAME.as_ptr(),
+                (*item.value).cast::<u8>(),
+                TRUNCATED_FRAME.len(),
+            );
+            *item.real_length = 9;
+            *item.result = RET_MMS_OK;
             continue;
         }
         if key == RESIZE_EXHAUSTION_KEY {
@@ -312,7 +330,8 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         .put(LARGE_KEY, Bytes::from(vec![b'l'; LARGE_PAYLOAD_SIZE]))
         .await
         .unwrap();
-    fake_store().lock().unwrap().get_calls.clear();
+    first.put(EMPTY_KEY, Bytes::new()).await.unwrap();
+    take_get_calls();
     assert_eq!(
         first
             .batch_get(&[SMALL_KEY.into(), LARGE_KEY.into()])
@@ -324,7 +343,7 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         ]
     );
     assert_eq!(
-        fake_store().lock().unwrap().get_calls,
+        take_get_calls(),
         vec![
             vec![
                 (SMALL_KEY.into(), INITIAL_READ_BUFFER_SIZE),
@@ -334,21 +353,51 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         ]
     );
 
-    fake_store().lock().unwrap().get_calls.clear();
     assert_eq!(
         first.get(SMALL_KEY).await.unwrap(),
         Some(Bytes::from(vec![b's'; SMALL_PAYLOAD_SIZE]))
     );
     assert_eq!(
-        fake_store().lock().unwrap().get_calls,
+        take_get_calls(),
         vec![vec![(SMALL_KEY.into(), INITIAL_READ_BUFFER_SIZE)]]
+    );
+    assert_eq!(first.get(EMPTY_KEY).await.unwrap(), Some(Bytes::new()));
+    assert_eq!(
+        take_get_calls(),
+        vec![vec![(EMPTY_KEY.into(), INITIAL_READ_BUFFER_SIZE)]]
+    );
+
+    let chunk_keys = (0..=MAX_READ_BATCH_SIZE)
+        .map(|index| format!("chunk-{index:03}"))
+        .collect::<Vec<_>>();
+    {
+        let mut state = fake_store().lock().unwrap();
+        for key in &chunk_keys {
+            state.values.insert(key.clone(), frame(b"c"));
+        }
+    }
+    take_get_calls();
+    let chunk_results = first.batch_get(&chunk_keys).await.unwrap();
+    assert_eq!(
+        chunk_results,
+        vec![Some(Bytes::from_static(b"c")); chunk_keys.len()]
+    );
+    let chunk_calls = take_get_calls();
+    assert_eq!(chunk_calls.len(), 2);
+    assert_eq!(chunk_calls[0].len(), MAX_READ_BATCH_SIZE);
+    assert!(chunk_calls[0]
+        .iter()
+        .all(|(_, buffer_size)| *buffer_size == INITIAL_READ_BUFFER_SIZE));
+    assert_eq!(
+        chunk_calls[1],
+        vec![(
+            chunk_keys[MAX_READ_BATCH_SIZE].clone(),
+            INITIAL_READ_BUFFER_SIZE,
+        )]
     );
 
     first
-        .put(
-            "shorter",
-            Bytes::from_static(b"a much longer original value"),
-        )
+        .put("shorter", Bytes::from(vec![b'o'; LARGE_PAYLOAD_SIZE]))
         .await
         .unwrap();
     first
@@ -356,13 +405,13 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         .await
         .unwrap();
     assert!(first.exists("shorter").await.unwrap());
-    fake_store().lock().unwrap().get_calls.clear();
+    take_get_calls();
     assert_eq!(
         first.get("shorter").await.unwrap(),
         Some(Bytes::from_static(b"new"))
     );
     assert_eq!(
-        fake_store().lock().unwrap().get_calls,
+        take_get_calls(),
         vec![vec![("shorter".into(), INITIAL_READ_BUFFER_SIZE)]]
     );
 
@@ -381,12 +430,25 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
     ));
 
     let keys = vec!["shorter".into(), GROWING_KEY.into(), "missing".into()];
+    take_get_calls();
     assert_eq!(
         first.batch_get(&keys).await.unwrap(),
         vec![
             Some(Bytes::from_static(b"new")),
             Some(Bytes::from(vec![b'g'; GROWN_PAYLOAD_SIZE])),
             None,
+        ]
+    );
+    assert_eq!(
+        take_get_calls(),
+        vec![
+            vec![
+                ("shorter".into(), INITIAL_READ_BUFFER_SIZE),
+                (GROWING_KEY.into(), INITIAL_READ_BUFFER_SIZE),
+                ("missing".into(), INITIAL_READ_BUFFER_SIZE),
+            ],
+            vec![(GROWING_KEY.into(), 9 + INITIAL_READ_BUFFER_SIZE)],
+            vec![(GROWING_KEY.into(), 9 + GROWN_PAYLOAD_SIZE)],
         ]
     );
     assert!(matches!(
@@ -402,9 +464,23 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         CacheError::Internal(_)
     ));
     assert!(matches!(
+        first.get(TRUNCATED_KEY).await.unwrap_err(),
+        CacheError::InvalidData(_)
+    ));
+    take_get_calls();
+    assert!(matches!(
         first.get(RESIZE_EXHAUSTION_KEY).await.unwrap_err(),
         CacheError::Unavailable(_)
     ));
+    assert_eq!(
+        take_get_calls(),
+        vec![
+            vec![(RESIZE_EXHAUSTION_KEY.into(), 4096)],
+            vec![(RESIZE_EXHAUSTION_KEY.into(), 4105)],
+            vec![(RESIZE_EXHAUSTION_KEY.into(), 4114)],
+            vec![(RESIZE_EXHAUSTION_KEY.into(), 4123)],
+        ]
+    );
     assert!(matches!(
         first.get(ITEM_EPERM_KEY).await.unwrap_err(),
         CacheError::InvalidArgument(_)
