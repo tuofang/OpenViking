@@ -236,7 +236,11 @@ impl NativeMemStore {
                                     }
                                 };
                             let required_size = HEADER_LEN + current_payload;
-                            if required_size > item.buffer_size {
+                            if read.real_length < required_size {
+                                outcomes[item.index] = Some(Err(MemStoreStoreError::InvalidData(
+                                    "MemStore get returned a truncated frame".into(),
+                                )));
+                            } else if required_size > item.buffer_size {
                                 if item.resize_attempts < MAX_RESIZE_ATTEMPTS {
                                     retries.push(PendingRead {
                                         index: item.index,
@@ -250,10 +254,6 @@ impl NativeMemStore {
                                                 .into(),
                                         )));
                                 }
-                            } else if read.real_length < required_size {
-                                outcomes[item.index] = Some(Err(MemStoreStoreError::InvalidData(
-                                    "MemStore get returned a truncated frame".into(),
-                                )));
                             } else {
                                 outcomes[item.index] =
                                     Some(decode_value(&read.buffer, self.max_value_size).map(Some));

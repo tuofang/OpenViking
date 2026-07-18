@@ -27,6 +27,7 @@ const SMALL_KEY: &str = "small";
 const LARGE_KEY: &str = "large";
 const EMPTY_KEY: &str = "empty";
 const TRUNCATED_KEY: &str = "truncated";
+const OVERSIZED_TRUNCATED_KEY: &str = "oversized-truncated";
 const INITIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
 const MAX_READ_BATCH_SIZE: usize = 256;
 const SMALL_PAYLOAD_SIZE: usize = 1024;
@@ -183,6 +184,14 @@ unsafe extern "C" fn MmsGet(items: *mut GetItems, item_num: c_uint) -> i32 {
             );
             *item.real_length = 9;
             *item.result = RET_MMS_OK;
+            continue;
+        }
+        if key == OVERSIZED_TRUNCATED_KEY {
+            let oversized = frame(&vec![0; LARGE_PAYLOAD_SIZE]);
+            let copied = usize::min(item.length as usize, oversized.len());
+            std::ptr::copy_nonoverlapping(oversized.as_ptr(), (*item.value).cast::<u8>(), copied);
+            *item.real_length = item.length;
+            *item.result = RET_MMS_READ_EXCEED;
             continue;
         }
         if key == RESIZE_EXHAUSTION_KEY {
@@ -467,6 +476,18 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         first.get(TRUNCATED_KEY).await.unwrap_err(),
         CacheError::InvalidData(_)
     ));
+    take_get_calls();
+    assert!(matches!(
+        first.get(OVERSIZED_TRUNCATED_KEY).await.unwrap_err(),
+        CacheError::InvalidData(_)
+    ));
+    assert_eq!(
+        take_get_calls(),
+        vec![vec![(
+            OVERSIZED_TRUNCATED_KEY.into(),
+            INITIAL_READ_BUFFER_SIZE,
+        )]]
+    );
     take_get_calls();
     assert!(matches!(
         first.get(RESIZE_EXHAUSTION_KEY).await.unwrap_err(),
