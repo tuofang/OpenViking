@@ -5,8 +5,8 @@ use super::{
     CacheError, CacheMetrics, CachePolicy, CacheProvider, CacheResult, CacheTraversalMode,
 };
 use crate::core::filesystem::{
-    compile_grep_regex, default_grep_concurrency, grep_bytes, is_excluded_path,
-    normalize_prefix_path, relative_depth, relative_match_file,
+    compile_glob_matcher, compile_grep_regex, default_grep_concurrency, glob_matches_relative_path,
+    grep_bytes, is_excluded_path, normalize_prefix_path, relative_depth, relative_match_file,
 };
 use crate::core::{
     FileInfo, FileSystem, GrepResult, MultiWriteWrappedFS, Result, TreeEntry, WriteFlag,
@@ -219,6 +219,75 @@ impl CachedFileSystem {
                             stack.push(TreeTask::VisitDir(entry_path));
                         }
                         stack.push(TreeTask::Emit(tree_entry));
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn glob_directory_via_cache(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        enum GlobTask {
+            VisitDir(String),
+            Match { path: String, rel_path: String },
+        }
+
+        let matcher = compile_glob_matcher(pattern)?;
+        let base_path = normalize_prefix_path(path);
+        let mut result = Vec::new();
+        let generation_cache = Mutex::new(HashMap::new());
+        let mut stack = vec![GlobTask::VisitDir(base_path.clone())];
+
+        while let Some(task) = stack.pop() {
+            if node_limit.is_some_and(|limit| result.len() >= limit) {
+                break;
+            }
+
+            match task {
+                GlobTask::Match { path, rel_path } => {
+                    if glob_matches_relative_path(&matcher, &rel_path) {
+                        result.push(path);
+                    }
+                }
+                GlobTask::VisitDir(current_path) => {
+                    if let Some(limit) = level_limit {
+                        let current_rel = relative_match_file(&base_path, &current_path);
+                        if relative_depth(&current_rel) >= limit {
+                            continue;
+                        }
+                    }
+
+                    let entries = self
+                        .read_dir_with_generation_cache(&current_path, &generation_cache)
+                        .await?;
+                    for entry in entries.into_iter().rev() {
+                        let is_hidden_file = !entry.is_dir && entry.name.starts_with('.');
+                        if is_hidden_file && !show_hidden {
+                            continue;
+                        }
+
+                        let entry_path = if current_path == "/" {
+                            format!("/{}", entry.name)
+                        } else {
+                            format!("{}/{}", current_path, entry.name)
+                        };
+                        let rel_path = relative_match_file(&base_path, &entry_path);
+
+                        if entry.is_dir {
+                            stack.push(GlobTask::VisitDir(entry_path.clone()));
+                        }
+                        stack.push(GlobTask::Match {
+                            path: entry_path,
+                            rel_path,
+                        });
                     }
                 }
             }
@@ -1570,6 +1639,27 @@ impl FileSystem for CachedFileSystem {
 
         self.backend
             .tree_directory(path, show_hidden, node_limit, level_limit)
+            .await
+    }
+
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        if self.policy.traversal_mode() == CacheTraversalMode::CachedTraversal
+            && !self.wraps_multiwrite()
+        {
+            return self
+                .glob_directory_via_cache(path, pattern, show_hidden, node_limit, level_limit)
+                .await;
+        }
+
+        self.backend
+            .glob_directory(path, pattern, show_hidden, node_limit, level_limit)
             .await
     }
 }

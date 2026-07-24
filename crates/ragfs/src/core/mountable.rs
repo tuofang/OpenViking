@@ -871,6 +871,66 @@ impl FileSystem for MountableFS {
 
         Ok(entries)
     }
+
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        if node_limit == Some(0) {
+            return Ok(Vec::new());
+        }
+
+        let (mount_info, rel_path) = self.find_mount(path).await?;
+        let mount_prefix = if mount_info.path == "/" {
+            String::new()
+        } else {
+            mount_info.path.clone()
+        };
+        let mut inner_limit = node_limit;
+
+        loop {
+            let raw_matches = mount_info
+                .fs
+                .glob_directory(&rel_path, pattern, show_hidden, inner_limit, level_limit)
+                .await?;
+            let raw_count = raw_matches.len();
+            let mut matches = raw_matches;
+
+            if !mount_prefix.is_empty() {
+                for path in &mut matches {
+                    *path = if path == "/" {
+                        mount_prefix.clone()
+                    } else {
+                        format!("{}{}", mount_prefix, path)
+                    };
+                }
+            }
+
+            matches.retain(|path| path.rsplit('/').next() != Some(PATH_LOCK_FILE));
+
+            let Some(limit) = node_limit else {
+                return Ok(matches);
+            };
+            if matches.len() >= limit {
+                matches.truncate(limit);
+                return Ok(matches);
+            }
+
+            let current_limit = inner_limit.expect("limited glob must have an inner limit");
+            if raw_count < current_limit {
+                return Ok(matches);
+            }
+            let next_limit = current_limit.saturating_mul(2);
+            if next_limit == current_limit {
+                return Ok(matches);
+            }
+            inner_limit = Some(next_limit);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1668,6 +1728,29 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].path, "/rewrite/sub/file.txt");
         assert_eq!(result[0].rel_path, "sub/file.txt");
+    }
+
+    #[tokio::test]
+    async fn test_glob_refetches_after_mount_filter_consumes_limit() {
+        let mfs = MountableFS::new();
+        let plugin = MockPlugin::with_tree_entries(
+            "glob-filter",
+            vec![
+                make_tree_entry("/sub/.path.ovlock", ".path.ovlock", ".path.ovlock", false),
+                make_tree_entry("/sub/file.txt", "file.txt", "file.txt", false),
+            ],
+        );
+        mfs.register_plugin(plugin).await;
+        mfs.mount(test_config("glob-filter", "/rewrite"))
+            .await
+            .unwrap();
+
+        let result = mfs
+            .glob_directory("/rewrite/sub", "*", true, Some(1), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result, vec!["/rewrite/sub/file.txt"]);
     }
 
     #[tokio::test]

@@ -91,6 +91,172 @@ pub(crate) fn compile_grep_regex(pattern: &str, case_insensitive: bool) -> Resul
         .map_err(|e| Error::invalid_operation(format!("Invalid regex pattern: {}", e)))
 }
 
+pub(crate) struct RelativeGlobMatcher {
+    absolute: bool,
+    components: Vec<Regex>,
+}
+
+/// Compile a component-wise matcher for `pathlib.PurePath.match` semantics.
+pub(crate) fn compile_glob_matcher(pattern: &str) -> Result<RelativeGlobMatcher> {
+    let absolute = pattern.starts_with('/');
+    let components = pattern
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(compile_fnmatch_component)
+        .collect::<Result<Vec<_>>>()?;
+    if components.is_empty() {
+        return Err(Error::invalid_operation("glob pattern must not be empty"));
+    }
+
+    Ok(RelativeGlobMatcher {
+        absolute,
+        components,
+    })
+}
+
+fn compile_fnmatch_component(pattern: &str) -> Result<Regex> {
+    let chars = pattern.chars().collect::<Vec<_>>();
+    let mut source = String::from("(?s:\\A");
+    let mut index = 0;
+
+    while index < chars.len() {
+        let current = chars[index];
+        index += 1;
+        match current {
+            '*' => {
+                source.push_str(".*");
+                while index < chars.len() && chars[index] == '*' {
+                    index += 1;
+                }
+            }
+            '?' => source.push('.'),
+            '[' => {
+                let class_start = index;
+                let mut close = index;
+                if close < chars.len() && chars[close] == '!' {
+                    close += 1;
+                }
+                if close < chars.len() && chars[close] == ']' {
+                    close += 1;
+                }
+                while close < chars.len() && chars[close] != ']' {
+                    close += 1;
+                }
+
+                if close >= chars.len() {
+                    source.push_str("\\[");
+                    continue;
+                }
+
+                let class = &chars[class_start..close];
+                index = close + 1;
+                let mut chunks = Vec::<Vec<char>>::new();
+                if class.contains(&'-') {
+                    let mut chunk_start = 0;
+                    let mut search_from = if class.first() == Some(&'!') { 2 } else { 1 };
+                    while let Some(relative) = class[search_from.min(class.len())..]
+                        .iter()
+                        .position(|value| *value == '-')
+                    {
+                        let hyphen = search_from + relative;
+                        chunks.push(class[chunk_start..hyphen].to_vec());
+                        chunk_start = hyphen + 1;
+                        search_from = (hyphen + 3).min(class.len());
+                    }
+                    if chunk_start < class.len() {
+                        chunks.push(class[chunk_start..].to_vec());
+                    } else if let Some(last) = chunks.last_mut() {
+                        last.push('-');
+                    }
+
+                    for chunk_index in (1..chunks.len()).rev() {
+                        let previous_last = chunks[chunk_index - 1].last().copied();
+                        let current_first = chunks[chunk_index].first().copied();
+                        if previous_last
+                            .zip(current_first)
+                            .is_some_and(|(left, right)| left > right)
+                        {
+                            let mut merged = chunks[chunk_index - 1].clone();
+                            merged.pop();
+                            merged.extend(chunks[chunk_index].iter().skip(1));
+                            chunks[chunk_index - 1] = merged;
+                            chunks.remove(chunk_index);
+                        }
+                    }
+                } else {
+                    chunks.push(class.to_vec());
+                }
+
+                let mut stuff = String::new();
+                for (chunk_index, chunk) in chunks.iter().enumerate() {
+                    if chunk_index > 0 {
+                        stuff.push('-');
+                    }
+                    for class_char in chunk {
+                        match class_char {
+                            '\\' | '-' => {
+                                stuff.push('\\');
+                                stuff.push(*class_char);
+                            }
+                            '[' | '&' | '~' | '|' => {
+                                stuff.push('\\');
+                                stuff.push(*class_char);
+                            }
+                            _ => stuff.push(*class_char),
+                        }
+                    }
+                }
+
+                if stuff.is_empty() {
+                    source.push_str("(?:\\b\\B)");
+                } else if stuff == "!" {
+                    source.push('.');
+                } else {
+                    if stuff.starts_with('!') {
+                        stuff.replace_range(..1, "^");
+                    } else if stuff.starts_with('^') || stuff.starts_with('[') {
+                        stuff.insert(0, '\\');
+                    }
+                    source.push('[');
+                    source.push_str(&stuff);
+                    source.push(']');
+                }
+            }
+            _ => source.push_str(&regex::escape(&current.to_string())),
+        }
+    }
+
+    source.push_str("\\z)");
+    Regex::new(&source)
+        .map_err(|error| Error::invalid_operation(format!("Invalid glob pattern: {error}")))
+}
+
+/// Match `pathlib.PurePath.match` relative-pattern semantics.
+///
+/// Relative patterns are right-aligned: `*.txt` matches the final component,
+/// while `sub/*.txt` may match either `sub/a.txt` or `deep/sub/a.txt`.
+pub(crate) fn glob_matches_relative_path(matcher: &RelativeGlobMatcher, rel_path: &str) -> bool {
+    if matcher.absolute {
+        return false;
+    }
+
+    let rel_path = rel_path.trim_start_matches('/');
+    let mut path_components = rel_path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .rev();
+
+    for component_matcher in matcher.components.iter().rev() {
+        let Some(component) = path_components.next() else {
+            return false;
+        };
+        if !component_matcher.is_match(component) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Default file-level concurrency window for grep implementations.
 #[cfg(any(feature = "cache", feature = "s3"))]
 pub(crate) fn default_grep_concurrency() -> usize {
@@ -463,6 +629,41 @@ pub trait FileSystem: Send + Sync + Any {
         Ok(())
     }
 
+    /// Match paths below a directory and return absolute/plugin paths only.
+    ///
+    /// The default implementation preserves plugin-native `tree_directory`
+    /// behavior, then performs matching in Rust so external bindings do not
+    /// need to materialize every `TreeEntry`.
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        if node_limit == Some(0) {
+            return Ok(Vec::new());
+        }
+
+        let matcher = compile_glob_matcher(pattern)?;
+        let entries = self
+            .tree_directory(path, show_hidden, None, level_limit)
+            .await?;
+        let mut matches = Vec::new();
+
+        for entry in entries {
+            if glob_matches_relative_path(&matcher, &entry.rel_path) {
+                matches.push(entry.path);
+                if node_limit.is_some_and(|limit| matches.len() >= limit) {
+                    break;
+                }
+            }
+        }
+
+        Ok(matches)
+    }
+
     /// Recursively traverse a directory tree, returning a flat list of TreeEntry nodes.
     ///
     /// This is the public entry point. The default implementation uses recursive
@@ -676,6 +877,42 @@ mod tests {
     async fn test_filesystem_trait() {
         let fs = MockFS;
         assert!(fs.exists("/test").await);
+    }
+
+    #[test]
+    fn glob_matcher_preserves_pathlib_relative_suffix_semantics() {
+        let cases = [
+            ("file.txt", "**/*.txt", false),
+            ("shard/file.txt", "**/*.txt", true),
+            ("group/shard/file.txt", "*.txt", true),
+            ("group/shard/file.txt", "shard/*.txt", true),
+            ("a/b", "./a/b", true),
+            ("a/b", "a//b", true),
+            ("a/b", "a/b/", true),
+            ("foo[", "foo[", true),
+            ("a", "{a,b}", false),
+            ("a/b", "/a/b", false),
+            ("a", "[b-a]", false),
+            ("a", "[a--b]", false),
+            ("-", "[a--b]", false),
+            ("b", "[a--b]", true),
+            ("]", "[]a]", true),
+            ("[", "[[]", true),
+            ("a", "[a[]", true),
+            ("[", "[a[]", true),
+            ("a/b", "a/**/b", false),
+            ("a/x/b", "a/**/b", true),
+            ("a/x/y/b", "a/**/b", false),
+        ];
+
+        for (path, pattern, expected) in cases {
+            let matcher = compile_glob_matcher(pattern).unwrap();
+            assert_eq!(
+                glob_matches_relative_path(&matcher, path),
+                expected,
+                "path={path} pattern={pattern}"
+            );
+        }
     }
 
     #[derive(Default)]

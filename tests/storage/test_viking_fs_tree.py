@@ -377,6 +377,96 @@ async def test_iter_visible_tree_entries_show_hidden_passthrough(monkeypatch, fs
     assert captured["show_hidden"] is True
 
 
+# ── native glob traversal tests ──
+
+
+@pytest.mark.asyncio
+async def test_glob_uses_native_paths_without_materializing_tree_entries(monkeypatch, fs):
+    captured = {}
+
+    async def fake_glob_directory(path, pattern, **kwargs):
+        captured.update(path=path, pattern=pattern, **kwargs)
+        return [
+            "/local/test_account/resources/a.txt",
+            "/local/test_account/resources/sub/b.txt",
+        ]
+
+    async def fail_tree(*_args, **_kwargs):
+        raise AssertionError("glob must not materialize the Python tree path")
+
+    monkeypatch.setattr(fs._async_agfs, "glob_directory", fake_glob_directory)
+    monkeypatch.setattr(fs, "tree", fail_tree)
+    monkeypatch.setattr(
+        fs,
+        "_uri_to_path",
+        lambda _uri, **_kwargs: "/local/test_account/resources",
+    )
+    monkeypatch.setattr(fs, "_ctx_or_default", lambda _ctx=None: _default_ctx())
+    patch_visibility(monkeypatch, fs, is_accessible=True)
+
+    result = await fs.glob(
+        "**/*.txt",
+        uri="viking://resources",
+        node_limit=2,
+        ctx=_default_ctx(),
+    )
+
+    assert result == {
+        "matches": ["viking://resources/a.txt", "viking://resources/sub/b.txt"],
+        "count": 2,
+    }
+    assert captured == {
+        "path": "/local/test_account/resources",
+        "pattern": "**/*.txt",
+        "show_hidden": False,
+        "node_limit": 2 * fs._TREE_OVERFETCH_FACTOR,
+        "level_limit": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_glob_refetches_when_acl_filters_native_matches(monkeypatch, fs):
+    requested_limits = []
+    factor = fs._TREE_OVERFETCH_FACTOR
+    invisible = [f"/local/test_account/resources/hidden-{index}.txt" for index in range(2 * factor)]
+    visible = [
+        "/local/test_account/resources/visible-a.txt",
+        "/local/test_account/resources/visible-b.txt",
+    ]
+
+    async def fake_glob_directory(_path, _pattern, **kwargs):
+        requested_limits.append(kwargs["node_limit"])
+        if len(requested_limits) == 1:
+            return invisible
+        return invisible + visible
+
+    monkeypatch.setattr(fs._async_agfs, "glob_directory", fake_glob_directory)
+    monkeypatch.setattr(
+        fs,
+        "_uri_to_path",
+        lambda _uri, **_kwargs: "/local/test_account/resources",
+    )
+    monkeypatch.setattr(fs, "_ctx_or_default", lambda _ctx=None: _default_ctx())
+    patch_visibility(
+        monkeypatch,
+        fs,
+        is_accessible=lambda uri, _ctx: "hidden-" not in uri,
+    )
+
+    result = await fs.glob(
+        "*.txt",
+        uri="viking://resources",
+        node_limit=2,
+        ctx=_default_ctx(),
+    )
+
+    assert result["matches"] == [
+        "viking://resources/visible-a.txt",
+        "viking://resources/visible-b.txt",
+    ]
+    assert requested_limits == [2 * factor, 4 * factor]
+
+
 # ── _tree_original tests ──
 
 

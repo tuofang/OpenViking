@@ -17,6 +17,9 @@ class _SyncAGFS:
     def rm(self, path, **kwargs):
         return ("rm", path, kwargs)
 
+    def glob_directory(self, path, pattern, **kwargs):
+        return ("glob_directory", path, pattern, kwargs)
+
 
 @pytest.mark.asyncio
 async def test_async_agfs_client_hides_threadpool(monkeypatch):
@@ -58,3 +61,28 @@ async def test_async_agfs_client_hides_threadpool(monkeypatch):
             {"recursive": True, "ctx": {"account_id": "_system"}},
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_async_agfs_client_forwards_native_glob(monkeypatch):
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(async_client.asyncio, "to_thread", fake_to_thread)
+    agfs = AsyncAGFSClient(_SyncAGFS())
+
+    assert await agfs.glob_directory(
+        "/local/acct/resources",
+        "**/*.txt",
+        node_limit=8,
+    ) == (
+        "glob_directory",
+        "/local/acct/resources",
+        "**/*.txt",
+        {
+            "show_hidden": False,
+            "node_limit": 8,
+            "level_limit": None,
+            "ctx": {"account_id": "acct"},
+        },
+    )

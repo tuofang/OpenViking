@@ -93,6 +93,16 @@ class AGFSSyncClientProtocol(Protocol):
     ) -> list[Dict[str, Any]]:
         """Return a tree view for the given AGFS directory."""
 
+    def glob_directory(
+        self,
+        path: str,
+        pattern: str,
+        show_hidden: bool = False,
+        node_limit: int | None = None,
+        level_limit: int | None = None,
+    ) -> list[str]:
+        """Return native glob matches as AGFS paths."""
+
     def system_sync_status(self, path: str) -> Dict[str, Any]:
         """Return multi-write sync status for a file or directory path."""
 

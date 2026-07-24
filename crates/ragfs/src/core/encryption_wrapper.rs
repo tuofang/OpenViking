@@ -307,6 +307,50 @@ impl FileSystem for EncryptionWrappedFS {
             .collect())
     }
 
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        if node_limit == Some(0) {
+            return Ok(Vec::new());
+        }
+
+        let mut inner_limit = node_limit;
+        loop {
+            let raw_matches = self
+                .inner
+                .glob_directory(path, pattern, show_hidden, inner_limit, level_limit)
+                .await?;
+            let raw_count = raw_matches.len();
+            let mut matches = raw_matches
+                .into_iter()
+                .filter(|path| !Self::is_shape_manifest_path(path))
+                .collect::<Vec<_>>();
+
+            let Some(limit) = node_limit else {
+                return Ok(matches);
+            };
+            if matches.len() >= limit {
+                matches.truncate(limit);
+                return Ok(matches);
+            }
+
+            let current_limit = inner_limit.expect("limited glob must have an inner limit");
+            if raw_count < current_limit {
+                return Ok(matches);
+            }
+            let next_limit = current_limit.saturating_mul(2);
+            if next_limit == current_limit {
+                return Ok(matches);
+            }
+            inner_limit = Some(next_limit);
+        }
+    }
+
     async fn ensure_parent_dirs(&self, path: &str, mode: u32) -> Result<()> {
         self.inner.ensure_parent_dirs(path, mode).await
     }

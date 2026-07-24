@@ -21,7 +21,6 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.core.namespace import canonicalize_uri
@@ -920,17 +919,47 @@ class VikingFS:
         ctx: Optional[RequestContext] = None,
     ) -> Dict:
         """File pattern matching, supports **/*.md recursive."""
-        entries = await self.tree(uri, node_limit=1000000, level_limit=None, ctx=ctx)
-        base_uri = uri.rstrip("/")
-        matches = []
-        for entry in entries:
-            rel_path = entry.get("rel_path", "")
-            if PurePath(rel_path).match(pattern):
-                matches.append(f"{base_uri}/{rel_path}")
-        # Now apply node limit to the filtered matches
-        if node_limit is not None and node_limit > 0:
-            matches = matches[:node_limit]
-        return {"matches": matches, "count": len(matches)}
+        if not pattern:
+            raise ValueError("glob pattern must not be empty")
+
+        self._ensure_access(uri, ctx)
+        path = self._uri_to_path(uri, ctx=ctx)
+        real_ctx = self._ctx_or_default(ctx)
+        visible_limit = node_limit if node_limit is not None and node_limit > 0 else None
+        raw_limit = (
+            max(visible_limit * self._TREE_OVERFETCH_FACTOR, visible_limit)
+            if visible_limit is not None
+            else None
+        )
+
+        while True:
+            raw_paths = await self._async_agfs.glob_directory(
+                path,
+                pattern,
+                show_hidden=False,
+                node_limit=raw_limit,
+                level_limit=None,
+            )
+
+            matches = []
+            for entry_path in raw_paths:
+                if visible_limit is not None and len(matches) >= visible_limit:
+                    break
+                if not self._is_tree_path_visible(entry_path, path, real_ctx):
+                    continue
+                matches.append(self._path_to_uri(entry_path, ctx=ctx))
+
+            need_more = (
+                visible_limit is not None
+                and len(matches) < visible_limit
+                and raw_limit is not None
+                and len(raw_paths) >= raw_limit
+            )
+            if need_more:
+                raw_limit *= 2
+                continue
+
+            return {"matches": matches, "count": len(matches)}
 
     async def _batch_fetch_abstracts(
         self,
@@ -1560,7 +1589,10 @@ class VikingFS:
         2. Self — the entry's own name must pass _ls_entries at its parent level.
         3. ACL — the entry must be accessible by the requesting context.
         """
-        entry_path = entry["path"]
+        return self._is_tree_path_visible(entry["path"], base_path, ctx)
+
+    def _is_tree_path_visible(self, entry_path: str, base_path: str, ctx: RequestContext) -> bool:
+        """Apply tree visibility and ACL checks to a filesystem path."""
 
         if self._ancestor_is_filtered(entry_path, base_path):
             return False

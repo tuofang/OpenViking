@@ -197,4 +197,21 @@ impl FileSystem for StatsWrappedFS {
         timer.finish().await;
         result
     }
+
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        let timer = OperationTimer::start(FsOperation::TreeDir, Arc::clone(&self.stats));
+        let result = self
+            .inner
+            .glob_directory(path, pattern, show_hidden, node_limit, level_limit)
+            .await;
+        timer.finish().await;
+        result
+    }
 }

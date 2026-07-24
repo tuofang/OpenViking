@@ -224,6 +224,26 @@ class AsyncAGFSClient:
             ctx=_fs_ctx_or_default(path, fs_ctx),
         )
 
+    async def glob_directory(
+        self,
+        path: str,
+        pattern: str,
+        show_hidden: bool = False,
+        node_limit: int | None = None,
+        level_limit: int | None = None,
+        *,
+        fs_ctx: Dict[str, str] | None = None,
+    ) -> list[str]:
+        return await self.run(
+            "glob_directory",
+            path,
+            pattern,
+            show_hidden=show_hidden,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            ctx=_fs_ctx_or_default(path, fs_ctx),
+        )
+
     async def system_sync_status(
         self, path: str, *, fs_ctx: Dict[str, str] | None = None
     ) -> Dict[str, Any]:

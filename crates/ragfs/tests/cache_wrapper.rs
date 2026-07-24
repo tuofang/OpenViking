@@ -18,6 +18,7 @@ struct CountingFileSystem {
     read_dirs: Arc<AtomicU64>,
     stats: Arc<AtomicU64>,
     greps: Arc<AtomicU64>,
+    globs: Arc<AtomicU64>,
     trees: Arc<AtomicU64>,
     read_delay: Duration,
     stat_delay: Duration,
@@ -171,6 +172,7 @@ impl CountingFileSystem {
             read_dirs: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(AtomicU64::new(0)),
             greps: Arc::new(AtomicU64::new(0)),
+            globs: Arc::new(AtomicU64::new(0)),
             trees: Arc::new(AtomicU64::new(0)),
             read_delay: Duration::ZERO,
             stat_delay: Duration::ZERO,
@@ -201,6 +203,10 @@ impl CountingFileSystem {
 
     fn grep_count(&self) -> u64 {
         self.greps.load(Ordering::Relaxed)
+    }
+
+    fn glob_count(&self) -> u64 {
+        self.globs.load(Ordering::Relaxed)
     }
 
     fn tree_count(&self) -> u64 {
@@ -287,6 +293,20 @@ impl FileSystem for CountingFileSystem {
             .await
     }
 
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        self.globs.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .glob_directory(path, pattern, show_hidden, node_limit, level_limit)
+            .await
+    }
+
     async fn tree_directory(
         &self,
         path: &str,
@@ -363,6 +383,27 @@ async fn default_tree_directory_delegates_to_backend() {
 
     assert_eq!(entries.len(), 1);
     assert_eq!(probe.tree_count(), 1);
+    assert_eq!(probe.read_dir_count(), 0);
+}
+
+#[tokio::test]
+async fn default_glob_directory_delegates_to_backend() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend
+        .write("/docs/one.md", b"one", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let probe = backend.clone();
+    let (fs, _) = cached_fs(backend);
+
+    let matches = fs
+        .glob_directory("/docs", "*.md", false, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(matches, vec!["/docs/one.md"]);
+    assert_eq!(probe.glob_count(), 1);
     assert_eq!(probe.read_dir_count(), 0);
 }
 
@@ -983,6 +1024,143 @@ async fn cached_tree_traversal_matches_default_tree_semantics() {
             .any(|entry| entry.rel_path == ".hidden.md"),
         "show_hidden=true should include hidden files"
     );
+}
+
+#[tokio::test]
+async fn cached_glob_traversal_matches_python_relative_pattern_semantics() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend.mkdir("/docs/deep", 0o755).await.unwrap();
+    backend.mkdir("/docs/deep/sub", 0o755).await.unwrap();
+    backend.mkdir("/docs/sub", 0o755).await.unwrap();
+    backend
+        .write("/docs/root.txt", b"root", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    backend
+        .write("/docs/deep/sub/deep.txt", b"deep", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    backend
+        .write("/docs/sub/one.md", b"one", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    backend
+        .write("/docs/sub/two.txt", b"two", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let direct = backend.clone();
+    let (fs, _) = cached_fs_with_policy(
+        backend,
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    for pattern in ["**/*.txt", "*.txt", "sub/*.txt"] {
+        let cached = fs
+            .glob_directory("/docs", pattern, false, None, None)
+            .await
+            .unwrap();
+        let expected = direct
+            .glob_directory("/docs", pattern, false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(cached, expected, "pattern {pattern}");
+    }
+
+    let recursive = fs
+        .glob_directory("/docs", "**/*.txt", false, None, None)
+        .await
+        .unwrap();
+    assert!(!recursive.iter().any(|path| path == "/docs/root.txt"));
+}
+
+#[tokio::test]
+async fn cached_glob_stops_before_expanding_later_directories_at_match_limit() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend.mkdir("/docs/first", 0o755).await.unwrap();
+    backend.mkdir("/docs/second", 0o755).await.unwrap();
+    backend
+        .write("/docs/first/one.txt", b"first", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    backend
+        .write("/docs/second/two.txt", b"second", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let probe = backend.clone();
+    let (fs, _) = cached_fs_with_policy(
+        backend,
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    let matches = fs
+        .glob_directory("/docs", "*", false, Some(1), None)
+        .await
+        .unwrap();
+
+    assert_eq!(matches.len(), 1);
+    assert!(matches[0] == "/docs/first" || matches[0] == "/docs/second");
+    assert_eq!(probe.read_dir_count(), 1);
+    assert_eq!(probe.glob_count(), 0);
+    assert_eq!(probe.tree_count(), 0);
+}
+
+#[tokio::test]
+async fn cached_glob_traversal_falls_back_for_multiwrite_backend() {
+    let primary = CountingFileSystem::new();
+    primary.mkdir("/docs", 0o755).await.unwrap();
+    primary
+        .write("/docs/a.md", b"a", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let primary_probe = primary.clone();
+    let multiwrite = MultiWriteWrappedFS::builder(Arc::new(primary))
+        .build()
+        .unwrap();
+    let fs = CachedFileSystem::new(
+        Box::new(multiwrite),
+        Arc::new(MemoryCacheProvider::new()),
+        CacheNamespace::new("glob-multiwrite"),
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    let ctx = Arc::new(FsContextInner::new("acct"));
+    let matches = FS_CTX
+        .scope(ctx, async {
+            fs.glob_directory("/docs", "*.md", false, None, None)
+                .await
+                .unwrap()
+        })
+        .await;
+
+    assert_eq!(matches, vec!["/docs/a.md"]);
+    assert_eq!(
+        primary_probe.tree_count(),
+        1,
+        "multi-write backends must retain their merged tree semantics"
+    );
+    assert_eq!(
+        primary_probe.read_dir_count(),
+        0,
+        "cached glob traversal must not bypass the multi-write wrapper"
+    );
+}
+
+#[tokio::test]
+async fn glob_directory_zero_limit_returns_no_matches() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend
+        .write("/docs/a.md", b"a", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+
+    assert!(backend
+        .glob_directory("/docs", "*.md", false, Some(0), None)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

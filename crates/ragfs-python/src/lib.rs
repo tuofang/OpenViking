@@ -1635,6 +1635,47 @@ impl RAGFSBindingClient {
         })
     }
 
+    /// Match directory entries and return filesystem paths only.
+    ///
+    /// Args:
+    ///     path: The root path of the traversal
+    ///     pattern: Relative glob pattern using pathlib-compatible matching
+    ///     show_hidden: Whether to include hidden files (default: False)
+    ///     node_limit: Maximum number of matched paths to return
+    ///     level_limit: Maximum depth relative to query root
+    ///     ctx: Optional FsContext dict (e.g. {"account_id": ...})
+    #[pyo3(signature = (path, pattern, show_hidden=false, node_limit=None, level_limit=None, ctx=None))]
+    fn glob_directory(
+        &self,
+        py: Python<'_>,
+        path: String,
+        pattern: String,
+        show_hidden: bool,
+        node_limit: Option<i32>,
+        level_limit: Option<i32>,
+        ctx: Option<HashMap<String, String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let fs_ctx = build_fs_context(ctx);
+        let top = self.top.clone();
+        let limit = node_limit.map(|n| if n < 0 { 0 } else { n as usize });
+        let level_limit_usize = level_limit.map(|n| if n < 0 { 0 } else { n as usize });
+
+        let matches = self
+            .run_scoped(py, fs_ctx, move || async move {
+                top.glob_directory(&path, &pattern, show_hidden, limit, level_limit_usize)
+                    .await
+            })
+            .map_err(to_py_err)?;
+
+        Python::attach(|py| {
+            let list = PyList::empty(py);
+            for path in matches {
+                list.append(path)?;
+            }
+            Ok(list.into())
+        })
+    }
+
     /// Query multi-write sync status under a file or directory path.
     ///
     /// Args:
