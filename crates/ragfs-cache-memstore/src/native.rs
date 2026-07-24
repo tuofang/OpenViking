@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 const RESULT_SENTINEL: i32 = i32::MIN;
 const HEALTH_KEY: &str = "ovms:health:reserved-never-written:v1";
 const INITIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
+const DIRECTORY_READ_BUFFER_SIZE: usize = 32 * 1024;
 const MAX_READ_BATCH_SIZE: usize = 256;
 const MAX_RESIZE_ATTEMPTS: usize = 3;
 
@@ -194,11 +195,10 @@ impl NativeMemStore {
             .take(keys.len())
             .collect::<Vec<Option<MemStoreItemResult<Option<Vec<u8>>>>>>();
         let max_frame_size = HEADER_LEN + self.max_value_size;
-        let initial_buffer_size = INITIAL_READ_BUFFER_SIZE.min(max_frame_size);
         let mut pending = (0..native_keys.len())
             .map(|index| PendingRead {
                 index,
-                buffer_size: initial_buffer_size,
+                buffer_size: initial_read_buffer_size(&keys[index], max_frame_size),
                 resize_attempts: 0,
             })
             .collect::<Vec<_>>();
@@ -452,6 +452,25 @@ impl MemStoreKvStore for NativeMemStore {
     fn shutdown(&self) -> Result<(), MemStoreStoreError> {
         self.release()
     }
+}
+
+fn initial_read_buffer_size(key: &str, max_frame_size: usize) -> usize {
+    let preferred = if is_ragfs_directory_key(key) {
+        DIRECTORY_READ_BUFFER_SIZE
+    } else {
+        INITIAL_READ_BUFFER_SIZE
+    };
+    preferred.min(max_frame_size)
+}
+
+fn is_ragfs_directory_key(key: &str) -> bool {
+    let Some((prefix_and_kind, _hash)) = key.rsplit_once(':') else {
+        return false;
+    };
+    let Some((prefix, kind)) = prefix_and_kind.rsplit_once(':') else {
+        return false;
+    };
+    prefix.starts_with("ragfs:v2:") && kind == "dir"
 }
 
 impl MemStoreProvider {

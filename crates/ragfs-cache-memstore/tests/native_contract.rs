@@ -28,7 +28,9 @@ const LARGE_KEY: &str = "large";
 const EMPTY_KEY: &str = "empty";
 const TRUNCATED_KEY: &str = "truncated";
 const OVERSIZED_TRUNCATED_KEY: &str = "oversized-truncated";
+const RAGFS_DIRECTORY_KEY: &str = "ragfs:v2:test:/local:dir:0123456789abcdef";
 const INITIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
+const DIRECTORY_READ_BUFFER_SIZE: usize = 32 * 1024;
 const MAX_READ_BATCH_SIZE: usize = 256;
 const SMALL_PAYLOAD_SIZE: usize = 1024;
 const LARGE_PAYLOAD_SIZE: usize = 5000;
@@ -264,7 +266,7 @@ fn config() -> MemStoreConfig {
     MemStoreConfig {
         sdk_concurrency: 2,
         operation_timeout_ms: 500,
-        max_value_size_bytes: 8 * 1_024,
+        max_value_size_bytes: 64 * 1_024,
         ..MemStoreConfig::default()
     }
 }
@@ -339,6 +341,13 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         .put(LARGE_KEY, Bytes::from(vec![b'l'; LARGE_PAYLOAD_SIZE]))
         .await
         .unwrap();
+    first
+        .put(
+            RAGFS_DIRECTORY_KEY,
+            Bytes::from(vec![b'd'; LARGE_PAYLOAD_SIZE]),
+        )
+        .await
+        .unwrap();
     first.put(EMPTY_KEY, Bytes::new()).await.unwrap();
     take_get_calls();
     assert_eq!(
@@ -360,6 +369,18 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
             ],
             vec![(LARGE_KEY.into(), 9 + LARGE_PAYLOAD_SIZE)],
         ]
+    );
+
+    assert_eq!(
+        first.get(RAGFS_DIRECTORY_KEY).await.unwrap(),
+        Some(Bytes::from(vec![b'd'; LARGE_PAYLOAD_SIZE]))
+    );
+    assert_eq!(
+        take_get_calls(),
+        vec![vec![(
+            RAGFS_DIRECTORY_KEY.into(),
+            DIRECTORY_READ_BUFFER_SIZE,
+        )]]
     );
 
     assert_eq!(
