@@ -11,11 +11,13 @@ const CACHE_ENVELOPE_MAGIC: &[u8; 4] = b"RGFC";
 const CACHE_ENVELOPE_VERSION: u8 = 2;
 const KIND_FILE: u8 = 1;
 const KIND_DIRECTORY: u8 = 2;
+const KIND_STAT: u8 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum CacheObjectKind {
     File,
     Directory,
+    Stat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +30,7 @@ pub(crate) struct GenerationSnapshot {
 enum CachePayload {
     File(Vec<u8>),
     Directory(Vec<FileInfo>),
+    Stat(FileInfo),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +109,16 @@ impl CacheEnvelope {
         }
     }
 
+    pub fn stat(path: String, info: FileInfo, generations: Vec<GenerationSnapshot>) -> Self {
+        Self {
+            version: CACHE_ENVELOPE_VERSION,
+            kind: CacheObjectKind::Stat,
+            path,
+            generations,
+            payload: CachePayload::Stat(info),
+        }
+    }
+
     pub fn encode(&self) -> CacheResult<Bytes> {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(CACHE_ENVELOPE_MAGIC);
@@ -113,6 +126,7 @@ impl CacheEnvelope {
         encoded.push(match self.kind {
             CacheObjectKind::File => KIND_FILE,
             CacheObjectKind::Directory => KIND_DIRECTORY,
+            CacheObjectKind::Stat => KIND_STAT,
         });
         write_string(&mut encoded, &self.path)?;
         write_u32(&mut encoded, self.generations.len())?;
@@ -127,6 +141,11 @@ impl CacheEnvelope {
             }
             CachePayload::Directory(entries) => {
                 let payload = encode_directory_payload(entries)?;
+                write_u64(&mut encoded, payload.len())?;
+                encoded.extend_from_slice(&payload);
+            }
+            CachePayload::Stat(info) => {
+                let payload = encode_file_info_payload(info)?;
                 write_u64(&mut encoded, payload.len())?;
                 encoded.extend_from_slice(&payload);
             }
@@ -151,6 +170,7 @@ impl CacheEnvelope {
         let kind = match reader.read_u8()? {
             KIND_FILE => CacheObjectKind::File,
             KIND_DIRECTORY => CacheObjectKind::Directory,
+            KIND_STAT => CacheObjectKind::Stat,
             other => {
                 return Err(CacheError::InvalidData(format!(
                     "unsupported envelope kind {other}"
@@ -178,6 +198,7 @@ impl CacheEnvelope {
             CacheObjectKind::Directory => {
                 CachePayload::Directory(decode_directory_payload(payload_bytes)?)
             }
+            CacheObjectKind::Stat => CachePayload::Stat(decode_file_info_payload(payload_bytes)?),
         };
         Ok(Self {
             version,
@@ -215,6 +236,7 @@ impl CacheEnvelope {
         let kind = match reader.read_u8()? {
             KIND_FILE => CacheObjectKind::File,
             KIND_DIRECTORY => CacheObjectKind::Directory,
+            KIND_STAT => CacheObjectKind::Stat,
             other => {
                 return Err(CacheError::InvalidData(format!(
                     "unsupported envelope kind {other}"
@@ -262,7 +284,7 @@ impl CacheEnvelope {
     pub fn into_file(self) -> CacheResult<Vec<u8>> {
         match self.payload {
             CachePayload::File(data) => Ok(data),
-            CachePayload::Directory(_) => {
+            CachePayload::Directory(_) | CachePayload::Stat(_) => {
                 Err(CacheError::InvalidData("expected file payload".to_string()))
             }
         }
@@ -271,9 +293,18 @@ impl CacheEnvelope {
     pub fn into_directory(self) -> CacheResult<Vec<FileInfo>> {
         match self.payload {
             CachePayload::Directory(entries) => Ok(entries),
-            CachePayload::File(_) => Err(CacheError::InvalidData(
+            CachePayload::File(_) | CachePayload::Stat(_) => Err(CacheError::InvalidData(
                 "expected directory payload".to_string(),
             )),
+        }
+    }
+
+    pub fn into_stat(self) -> CacheResult<FileInfo> {
+        match self.payload {
+            CachePayload::Stat(info) => Ok(info),
+            CachePayload::File(_) | CachePayload::Directory(_) => {
+                Err(CacheError::InvalidData("expected stat payload".to_string()))
+            }
         }
     }
 }
@@ -302,15 +333,26 @@ fn encode_directory_payload(entries: &[FileInfo]) -> CacheResult<Vec<u8>> {
     let mut encoded = Vec::new();
     write_u32(&mut encoded, entries.len())?;
     for entry in entries {
-        write_string(&mut encoded, &entry.name)?;
-        encoded.extend_from_slice(&entry.size.to_be_bytes());
-        encoded.extend_from_slice(&entry.mode.to_be_bytes());
-        let (secs, nanos) = system_time_to_parts(entry.mod_time);
-        encoded.extend_from_slice(&secs.to_be_bytes());
-        encoded.extend_from_slice(&nanos.to_be_bytes());
-        encoded.push(u8::from(entry.is_dir));
+        encode_file_info(&mut encoded, entry)?;
     }
     Ok(encoded)
+}
+
+fn encode_file_info_payload(info: &FileInfo) -> CacheResult<Vec<u8>> {
+    let mut encoded = Vec::new();
+    encode_file_info(&mut encoded, info)?;
+    Ok(encoded)
+}
+
+fn encode_file_info(encoded: &mut Vec<u8>, info: &FileInfo) -> CacheResult<()> {
+    write_string(encoded, &info.name)?;
+    encoded.extend_from_slice(&info.size.to_be_bytes());
+    encoded.extend_from_slice(&info.mode.to_be_bytes());
+    let (secs, nanos) = system_time_to_parts(info.mod_time);
+    encoded.extend_from_slice(&secs.to_be_bytes());
+    encoded.extend_from_slice(&nanos.to_be_bytes());
+    encoded.push(u8::from(info.is_dir));
+    Ok(())
 }
 
 fn decode_directory_payload(value: &[u8]) -> CacheResult<Vec<FileInfo>> {
@@ -318,32 +360,7 @@ fn decode_directory_payload(value: &[u8]) -> CacheResult<Vec<FileInfo>> {
     let entry_count = reader.read_u32()? as usize;
     let mut entries = Vec::with_capacity(entry_count);
     for _ in 0..entry_count {
-        let name = reader.read_string()?;
-        let size = reader.read_u64()?;
-        let mode = reader.read_u32()?;
-        let secs = reader.read_i64()?;
-        let nanos = reader.read_u32()?;
-        if nanos >= 1_000_000_000 {
-            return Err(CacheError::InvalidData(
-                "invalid FileInfo timestamp nanos".to_string(),
-            ));
-        }
-        let is_dir = match reader.read_u8()? {
-            0 => false,
-            1 => true,
-            _ => {
-                return Err(CacheError::InvalidData(
-                    "invalid FileInfo directory flag".to_string(),
-                ))
-            }
-        };
-        entries.push(FileInfo {
-            name,
-            size,
-            mode,
-            mod_time: parts_to_system_time(secs, nanos),
-            is_dir,
-        });
+        entries.push(decode_file_info(&mut reader)?);
     }
     if !reader.is_finished() {
         return Err(CacheError::InvalidData(
@@ -351,6 +368,46 @@ fn decode_directory_payload(value: &[u8]) -> CacheResult<Vec<FileInfo>> {
         ));
     }
     Ok(entries)
+}
+
+fn decode_file_info_payload(value: &[u8]) -> CacheResult<FileInfo> {
+    let mut reader = BinaryReader::new(value);
+    let info = decode_file_info(&mut reader)?;
+    if !reader.is_finished() {
+        return Err(CacheError::InvalidData(
+            "trailing bytes in stat payload".to_string(),
+        ));
+    }
+    Ok(info)
+}
+
+fn decode_file_info(reader: &mut BinaryReader<'_>) -> CacheResult<FileInfo> {
+    let name = reader.read_string()?;
+    let size = reader.read_u64()?;
+    let mode = reader.read_u32()?;
+    let secs = reader.read_i64()?;
+    let nanos = reader.read_u32()?;
+    if nanos >= 1_000_000_000 {
+        return Err(CacheError::InvalidData(
+            "invalid FileInfo timestamp nanos".to_string(),
+        ));
+    }
+    let is_dir = match reader.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(CacheError::InvalidData(
+                "invalid FileInfo directory flag".to_string(),
+            ))
+        }
+    };
+    Ok(FileInfo {
+        name,
+        size,
+        mode,
+        mod_time: parts_to_system_time(secs, nanos),
+        is_dir,
+    })
 }
 
 fn system_time_to_parts(value: SystemTime) -> (i64, u32) {
@@ -506,5 +563,36 @@ mod tests {
             (encoded_start..encoded_end).contains(&payload_ptr),
             "file view payload should borrow from the encoded envelope buffer"
         );
+    }
+
+    #[test]
+    fn stat_envelope_round_trips_file_info() {
+        let info = FileInfo::new(
+            "a.txt".to_string(),
+            123,
+            0o640,
+            UNIX_EPOCH + Duration::new(42, 123_456_789),
+            false,
+        );
+        let envelope = CacheEnvelope::stat(
+            "/docs/a.txt".to_string(),
+            info,
+            vec![GenerationSnapshot {
+                key: "ragfs:v2:test:subtree:0000000000000001".to_string(),
+                value: 7,
+            }],
+        );
+
+        let decoded = CacheEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+        assert!(decoded.matches(CacheObjectKind::Stat, "/docs/a.txt"));
+        let decoded = decoded.into_stat().unwrap();
+        assert_eq!(decoded.name, "a.txt");
+        assert_eq!(decoded.size, 123);
+        assert_eq!(decoded.mode, 0o640);
+        assert_eq!(
+            decoded.mod_time,
+            UNIX_EPOCH + Duration::new(42, 123_456_789)
+        );
+        assert!(!decoded.is_dir);
     }
 }

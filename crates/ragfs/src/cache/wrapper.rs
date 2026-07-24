@@ -318,6 +318,10 @@ impl CachedFileSystem {
                     }
                 }
 
+                if self.policy.is_internal_control_path(&current_path) {
+                    continue;
+                }
+
                 file_batch.push(current_path);
                 if file_batch.len() >= grep_cache_file_concurrency() {
                     self.flush_grep_file_batch(
@@ -994,6 +998,46 @@ impl CachedFileSystem {
         }
     }
 
+    async fn probe_stat(&self, key: &str, path: &str) -> Option<FileInfo> {
+        let value = match self.cache_get(key).await {
+            Ok(value) => value?,
+            Err(_) => {
+                self.metrics.error();
+                self.mark_bypass(path).await;
+                return None;
+            }
+        };
+
+        let envelope = match CacheEnvelope::decode(&value) {
+            Ok(envelope) if envelope.matches(CacheObjectKind::Stat, path) => envelope,
+            _ => {
+                self.metrics.error();
+                self.cache_delete(key, path).await;
+                return None;
+            }
+        };
+
+        match self.generations_match_with_cache(&envelope, None).await {
+            Ok(true) => match envelope.into_stat() {
+                Ok(info) => Some(info),
+                Err(_) => {
+                    self.metrics.error();
+                    self.cache_delete(key, path).await;
+                    None
+                }
+            },
+            Ok(false) => {
+                self.cache_delete(key, path).await;
+                None
+            }
+            Err(_) => {
+                self.metrics.error();
+                self.mark_bypass(path).await;
+                None
+            }
+        }
+    }
+
     async fn acquire_inflight(&self, key: &str) -> (Arc<Mutex<()>>, bool) {
         let mut inflight = self.inflight.lock().await;
         if let Some(lock) = inflight.get(key) {
@@ -1176,9 +1220,26 @@ impl CachedFileSystem {
         }
     }
 
+    async fn fill_stat(&self, key: &str, path: &str, info: &FileInfo) {
+        let generations = match self.generation_snapshots(path).await {
+            Ok(generations) => generations,
+            Err(_) => {
+                self.metrics.error();
+                return;
+            }
+        };
+        match CacheEnvelope::stat(path.to_string(), info.clone(), generations).encode() {
+            Ok(value) => {
+                self.cache_put(key, value, path).await;
+            }
+            Err(_) => self.metrics.error(),
+        }
+    }
+
     async fn invalidate_path_objects(&self, path: &str) {
         self.cache_delete(&self.file_key(path), path).await;
         self.cache_delete(&self.directory_key(path), path).await;
+        self.cache_delete(&self.stat_key(path), path).await;
     }
 
     async fn invalidate_parent_directory(&self, path: &str) {
@@ -1193,6 +1254,10 @@ impl CachedFileSystem {
 
     fn directory_key(&self, path: &str) -> String {
         self.object_key("dir", path)
+    }
+
+    fn stat_key(&self, path: &str) -> String {
+        self.object_key("stat", path)
     }
 
     fn generation_key(&self, path: &str) -> String {
@@ -1225,6 +1290,7 @@ impl FileSystem for CachedFileSystem {
         self.backend.mkdir(path, mode).await?;
         self.bump_generation(path).await;
         self.cache_delete(&self.directory_key(path), path).await;
+        self.cache_delete(&self.stat_key(path), path).await;
         self.invalidate_parent_directory(path).await;
         Ok(())
     }
@@ -1303,6 +1369,8 @@ impl FileSystem for CachedFileSystem {
         let normalized = normalize_path(path);
         let key = self.file_key(&normalized);
         self.cache_delete(&key, &normalized).await;
+        self.cache_delete(&self.stat_key(&normalized), &normalized)
+            .await;
         if offset == 0
             && matches!(flags, WriteFlag::Create | WriteFlag::Truncate)
             && self.policy.cache_file(&normalized, data.len())
@@ -1361,7 +1429,47 @@ impl FileSystem for CachedFileSystem {
     }
 
     async fn stat(&self, path: &str) -> Result<FileInfo> {
-        self.backend.stat(path).await
+        if self.is_runtime_bypassed(path).await {
+            self.metrics.policy_bypass();
+            return self.backend.stat(path).await;
+        }
+
+        let _operation_guard = self.operation_lock.read().await;
+        if self.is_runtime_bypassed(path).await {
+            self.metrics.policy_bypass();
+            return self.backend.stat(path).await;
+        }
+
+        let normalized = normalize_path(path);
+        let key = self.stat_key(&normalized);
+        if let Some(info) = self.probe_stat(&key, &normalized).await {
+            return Ok(info);
+        }
+
+        let (inflight, leader) = self.acquire_inflight(&key).await;
+        if leader {
+            self.metrics.inflight_leader();
+        } else {
+            self.metrics.inflight_follower();
+        }
+        let inflight_guard = inflight.lock().await;
+
+        if !leader {
+            if let Some(info) = self.probe_stat(&key, &normalized).await {
+                self.metrics.inflight_backend_saved();
+                drop(inflight_guard);
+                self.release_inflight(&key, &inflight).await;
+                return Ok(info);
+            }
+        }
+
+        let info = self.backend.stat(path).await;
+        if let Ok(value) = &info {
+            self.fill_stat(&key, &normalized, value).await;
+        }
+        drop(inflight_guard);
+        self.release_inflight(&key, &inflight).await;
+        info
     }
 
     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
@@ -1388,6 +1496,7 @@ impl FileSystem for CachedFileSystem {
         let _guard = self.operation_lock.write().await;
         self.backend.truncate(path, size).await?;
         self.cache_delete(&self.file_key(path), path).await;
+        self.cache_delete(&self.stat_key(path), path).await;
         self.invalidate_parent_directory(path).await;
         Ok(())
     }

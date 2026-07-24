@@ -134,8 +134,14 @@ impl CachePolicy {
             return false;
         }
 
+        !self.is_internal_control_path(&normalized)
+    }
+
+    pub(crate) fn is_internal_control_path(&self, path: &str) -> bool {
+        let normalized = normalize_path(path);
         let name = normalized.rsplit('/').next().unwrap_or("");
         if name == ".path.ovlock"
+            || name.starts_with(".exact.ovlock.")
             || name.ends_with(".lock")
             || name.ends_with(".lck")
             || matches!(
@@ -151,10 +157,10 @@ impl CachePolicy {
                     | "pid"
             )
         {
-            return false;
+            return true;
         }
 
-        true
+        false
     }
 }
 

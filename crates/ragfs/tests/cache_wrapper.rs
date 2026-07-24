@@ -20,6 +20,7 @@ struct CountingFileSystem {
     greps: Arc<AtomicU64>,
     trees: Arc<AtomicU64>,
     read_delay: Duration,
+    stat_delay: Duration,
 }
 
 struct DeleteFailingProvider {
@@ -172,11 +173,17 @@ impl CountingFileSystem {
             greps: Arc::new(AtomicU64::new(0)),
             trees: Arc::new(AtomicU64::new(0)),
             read_delay: Duration::ZERO,
+            stat_delay: Duration::ZERO,
         }
     }
 
     fn with_read_delay(mut self, delay: Duration) -> Self {
         self.read_delay = delay;
+        self
+    }
+
+    fn with_stat_delay(mut self, delay: Duration) -> Self {
+        self.stat_delay = delay;
         self
     }
 
@@ -238,6 +245,9 @@ impl FileSystem for CountingFileSystem {
 
     async fn stat(&self, path: &str) -> Result<FileInfo> {
         self.stats.fetch_add(1, Ordering::Relaxed);
+        if !self.stat_delay.is_zero() {
+            tokio::time::sleep(self.stat_delay).await;
+        }
         self.inner.stat(path).await
     }
 
@@ -548,9 +558,50 @@ async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
     );
     assert_eq!(
         probe.stat_count(),
-        2,
-        "second grep should only stat the query root, not every cached entry"
+        1,
+        "second grep should reuse cached metadata for the query root"
     );
+}
+
+#[tokio::test]
+async fn cached_grep_skips_internal_control_files() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend
+        .write("/docs/content.md", b"needle", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    backend
+        .write("/docs/.path.ovlock", b"needle", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    backend
+        .write(
+            "/docs/.exact.ovlock.content.md.0123456789abcdef",
+            b"needle",
+            0,
+            WriteFlag::Create,
+        )
+        .await
+        .unwrap();
+    let probe = backend.clone();
+    let (fs, _) = cached_fs_with_policy(
+        backend,
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    let first = fs
+        .grep("/docs", "needle", true, false, None, None, None)
+        .await
+        .unwrap();
+    let second = fs
+        .grep("/docs", "needle", true, false, None, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(first.count, 1);
+    assert_eq!(second.count, 1);
+    assert_eq!(probe.read_count(), 1);
 }
 
 #[tokio::test]
@@ -1350,6 +1401,100 @@ async fn all_directory_membership_mutations_invalidate_parent_entries() {
 }
 
 #[tokio::test]
+async fn stat_cache_hits_avoid_repeated_backend_stat() {
+    let backend = CountingFileSystem::new();
+    backend
+        .write("/value.txt", b"value", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let probe = backend.clone();
+    let (fs, _) = cached_fs(backend);
+
+    let first = fs.stat("/value.txt").await.unwrap();
+    let second = fs.stat("/value.txt").await.unwrap();
+
+    assert_eq!(first.name, "value.txt");
+    assert_eq!(second.size, 5);
+    assert!(!second.is_dir);
+    assert_eq!(probe.stat_count(), 1);
+}
+
+#[tokio::test]
+async fn stat_cache_preserves_empty_file_and_directory_types() {
+    let backend = CountingFileSystem::new();
+    backend
+        .write("/empty.txt", b"", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    backend.mkdir("/docs", 0o750).await.unwrap();
+    let probe = backend.clone();
+    let (fs, _) = cached_fs(backend);
+
+    let empty = fs.stat("/empty.txt").await.unwrap();
+    let docs = fs.stat("/docs").await.unwrap();
+    let empty_hit = fs.stat("/empty.txt").await.unwrap();
+    let docs_hit = fs.stat("/docs").await.unwrap();
+
+    assert_eq!(empty.size, 0);
+    assert!(!empty.is_dir);
+    assert_eq!(empty_hit.size, 0);
+    assert!(!empty_hit.is_dir);
+    assert!(docs.is_dir);
+    assert!(docs_hit.is_dir);
+    assert_eq!(probe.stat_count(), 2);
+}
+
+#[tokio::test]
+async fn file_mutations_invalidate_cached_stat() {
+    let backend = CountingFileSystem::new();
+    backend
+        .write("/old.txt", b"old", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let probe = backend.clone();
+    let (fs, _) = cached_fs(backend);
+
+    assert_eq!(fs.stat("/old.txt").await.unwrap().size, 3);
+    fs.write("/old.txt", b"new-value", 0, WriteFlag::Truncate)
+        .await
+        .unwrap();
+    assert_eq!(fs.stat("/old.txt").await.unwrap().size, 9);
+
+    fs.rename("/old.txt", "/new.txt").await.unwrap();
+    assert!(fs.stat("/old.txt").await.is_err());
+    assert_eq!(fs.stat("/new.txt").await.unwrap().size, 9);
+
+    fs.remove("/new.txt").await.unwrap();
+    assert!(fs.stat("/new.txt").await.is_err());
+    assert_eq!(probe.stat_count(), 5);
+}
+
+#[tokio::test]
+async fn remove_all_generation_rejects_residual_stat_entries() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/tree", 0o755).await.unwrap();
+    backend
+        .write("/tree/leaf.txt", b"old", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let direct = backend.clone();
+    let probe = backend.clone();
+    let (fs, _) = cached_fs(backend);
+
+    assert_eq!(fs.stat("/tree/leaf.txt").await.unwrap().size, 3);
+    fs.remove_all("/tree").await.unwrap();
+
+    direct.mkdir("/tree", 0o755).await.unwrap();
+    direct
+        .write("/tree/leaf.txt", b"new-value", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+
+    assert_eq!(fs.stat("/tree/leaf.txt").await.unwrap().size, 9);
+    assert_eq!(probe.stat_count(), 2);
+}
+
+#[tokio::test]
 async fn writes_and_deletes_never_leave_stale_file_cache_entries() {
     let backend = CountingFileSystem::new();
     backend
@@ -1615,6 +1760,36 @@ async fn concurrent_misses_share_one_backend_read() {
     }
 
     assert_eq!(probe.read_count(), 1);
+    let metrics = fs.metrics().snapshot();
+    assert_eq!(metrics.inflight_leaders, 1);
+    assert_eq!(metrics.inflight_followers, 11);
+    assert_eq!(metrics.inflight_backend_saved, 11);
+}
+
+#[tokio::test]
+async fn concurrent_stat_misses_share_one_backend_stat() {
+    let backend = CountingFileSystem::new().with_stat_delay(Duration::from_millis(30));
+    backend
+        .write("/hot.md", b"hot", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let probe = backend.clone();
+    let (fs, _) = cached_fs(backend);
+
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let fs = fs.clone();
+        tasks.push(tokio::spawn(
+            async move { fs.stat("/hot.md").await.unwrap() },
+        ));
+    }
+    for task in tasks {
+        let info = task.await.unwrap();
+        assert_eq!(info.size, 3);
+        assert!(!info.is_dir);
+    }
+
+    assert_eq!(probe.stat_count(), 1);
     let metrics = fs.metrics().snapshot();
     assert_eq!(metrics.inflight_leaders, 1);
     assert_eq!(metrics.inflight_followers, 11);
