@@ -93,6 +93,41 @@ enum CachedFileDecode {
     },
 }
 
+fn decode_cached_file_batch(
+    values: Vec<Option<Bytes>>,
+    keys: Vec<String>,
+    paths: Vec<String>,
+) -> Vec<CachedFileDecode> {
+    values
+        .into_iter()
+        .zip(keys)
+        .zip(paths)
+        .enumerate()
+        .map(|(index, ((value, key), path))| {
+            let Some(value) = value else {
+                return CachedFileDecode::Missing { index };
+            };
+
+            match CacheEnvelope::decode_file_parts(&value) {
+                Ok(parts) if parts.path() == path => {
+                    let payload_range = parts.payload_range();
+                    CachedFileDecode::Hit(CachedFileCandidate {
+                        index,
+                        key,
+                        path,
+                        generations: parts.into_generations(),
+                        payload: CachedFilePayload {
+                            value,
+                            payload_range,
+                        },
+                    })
+                }
+                _ => CachedFileDecode::Invalid { index, key, path },
+            }
+        })
+        .collect()
+}
+
 impl CachedFilePayload {
     fn len(&self) -> usize {
         self.payload_range.len()
@@ -900,58 +935,33 @@ impl CachedFileSystem {
             }
         };
 
-        let decoded = stream::iter(
-            values
-                .into_iter()
-                .zip(keys.into_iter())
-                .zip(normalized_paths.into_iter())
-                .enumerate(),
-        )
-        .map(|(index, ((value, key), path))| {
-            tokio::task::spawn_blocking(move || {
-                let Some(value) = value else {
-                    return CachedFileDecode::Missing { index };
-                };
-
-                match CacheEnvelope::decode_file_parts(&value) {
-                    Ok(parts) if parts.path() == path => {
-                        let payload_range = parts.payload_range();
-                        CachedFileDecode::Hit(CachedFileCandidate {
-                            index,
-                            key,
-                            path,
-                            generations: parts.into_generations(),
-                            payload: CachedFilePayload {
-                                value,
-                                payload_range,
-                            },
-                        })
-                    }
-                    _ => CachedFileDecode::Invalid { index, key, path },
-                }
-            })
+        let decoded = tokio::task::spawn_blocking(move || {
+            decode_cached_file_batch(values, keys, normalized_paths)
         })
-        .buffer_unordered(grep_cache_file_concurrency())
-        .collect::<Vec<_>>()
         .await;
+
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                self.metrics.error();
+                return (0..paths.len()).map(|_| None).collect();
+            }
+        };
 
         let mut result = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
         let mut candidates = Vec::new();
         for decoded in decoded {
             match decoded {
-                Ok(CachedFileDecode::Missing { index }) => {
+                CachedFileDecode::Missing { index } => {
                     result[index] = None;
                 }
-                Ok(CachedFileDecode::Hit(candidate)) => {
+                CachedFileDecode::Hit(candidate) => {
                     candidates.push(candidate);
                 }
-                Ok(CachedFileDecode::Invalid { index, key, path }) => {
+                CachedFileDecode::Invalid { index, key, path } => {
                     self.metrics.error();
                     self.cache_delete(&key, &path).await;
                     result[index] = None;
-                }
-                Err(_) => {
-                    self.metrics.error();
                 }
             }
         }
@@ -1711,6 +1721,54 @@ fn is_same_or_descendant(path: &str, scope: &str) -> bool {
         || path
             .strip_prefix(scope)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+#[cfg(test)]
+mod cached_file_batch_decode_tests {
+    use super::{decode_cached_file_batch, CacheEnvelope, CachedFileDecode, GenerationSnapshot};
+    use bytes::Bytes;
+
+    #[test]
+    fn preserves_order_and_result_kinds() {
+        let valid = CacheEnvelope::file(
+            "/docs/valid.txt".to_string(),
+            b"valid payload".to_vec(),
+            vec![GenerationSnapshot {
+                key: "generation-key".to_string(),
+                value: 7,
+            }],
+        )
+        .encode()
+        .unwrap();
+
+        let decoded = decode_cached_file_batch(
+            vec![Some(valid), None, Some(Bytes::from_static(b"invalid"))],
+            vec!["key-0".into(), "key-1".into(), "key-2".into()],
+            vec![
+                "/docs/valid.txt".into(),
+                "/docs/missing.txt".into(),
+                "/docs/invalid.txt".into(),
+            ],
+        );
+
+        assert_eq!(decoded.len(), 3);
+        match &decoded[0] {
+            CachedFileDecode::Hit(candidate) => {
+                assert_eq!(candidate.index, 0);
+                assert_eq!(candidate.key, "key-0");
+                assert_eq!(candidate.path, "/docs/valid.txt");
+                assert_eq!(candidate.payload.as_bytes(), b"valid payload");
+                assert_eq!(candidate.generations.len(), 1);
+            }
+            _ => panic!("expected first item to be a hit"),
+        }
+        assert!(matches!(decoded[1], CachedFileDecode::Missing { index: 1 }));
+        assert!(matches!(
+            &decoded[2],
+            CachedFileDecode::Invalid { index: 2, key, path }
+                if key == "key-2" && path == "/docs/invalid.txt"
+        ));
+    }
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
