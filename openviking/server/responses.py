@@ -4,9 +4,31 @@
 
 from typing import Any, Dict, Optional
 
+import orjson
 from fastapi.responses import JSONResponse
+from starlette.responses import Response as StarletteResponse
 
 from openviking.server.models import ERROR_CODE_TO_HTTP_STATUS, ErrorInfo, Response
+
+
+def success_json_response(
+    result: Any,
+    *,
+    telemetry: Optional[Dict[str, Any]] = None,
+) -> StarletteResponse:
+    """Serialize a JSON-safe success result without FastAPI's recursive encoder."""
+    return StarletteResponse(
+        content=orjson.dumps(
+            {
+                "status": "ok",
+                "result": result,
+                "error": None,
+                "telemetry": telemetry,
+                "profile": None,
+            }
+        ),
+        media_type="application/json",
+    )
 
 
 def _message_from_business_error(result: Dict[str, Any]) -> str:

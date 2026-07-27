@@ -215,6 +215,15 @@ def test_is_tree_entry_visible_multiwrite_meta_filtered(monkeypatch, fs):
         assert fs._is_tree_entry_visible(entry, "/local/test_account", _default_ctx()) is False
 
 
+def test_root_visibility_skips_uri_normalization(monkeypatch, fs):
+    def fail_normalization(_uri):
+        raise AssertionError("ROOT visibility must not parse a URI it always permits")
+
+    monkeypatch.setattr(fs, "_normalized_uri_parts", fail_normalization)
+
+    assert fs._is_accessible("viking://resources/a.txt", _default_ctx()) is True
+
+
 def test_is_tree_entry_visible_default_ctx(monkeypatch, fs):
     """PY-FLT-010: ctx=None uses default context."""
     patch_visibility(monkeypatch, fs, is_accessible=True)
@@ -465,6 +474,40 @@ async def test_glob_refetches_when_acl_filters_native_matches(monkeypatch, fs):
         "viking://resources/visible-b.txt",
     ]
     assert requested_limits == [2 * factor, 4 * factor]
+
+
+@pytest.mark.asyncio
+async def test_glob_converts_each_visible_path_to_uri_once(monkeypatch, fs):
+    raw_paths = [
+        "/local/test_account/resources/a.txt",
+        "/local/test_account/resources/sub/b.txt",
+    ]
+    converted_paths = []
+
+    async def fake_glob_directory(_path, _pattern, **_kwargs):
+        return raw_paths
+
+    def tracked_path_to_uri(path, **_kwargs):
+        converted_paths.append(path)
+        return _std_path_to_uri(path)
+
+    monkeypatch.setattr(fs._async_agfs, "glob_directory", fake_glob_directory)
+    monkeypatch.setattr(
+        fs,
+        "_uri_to_path",
+        lambda _uri, **_kwargs: "/local/test_account/resources",
+    )
+    monkeypatch.setattr(fs, "_ctx_or_default", lambda _ctx=None: _default_ctx())
+    monkeypatch.setattr(fs, "_is_accessible", lambda _uri, _ctx: True)
+    monkeypatch.setattr(fs, "_path_to_uri", tracked_path_to_uri)
+
+    result = await fs.glob("**/*.txt", uri="viking://resources", ctx=_default_ctx())
+
+    assert result["matches"] == [
+        "viking://resources/a.txt",
+        "viking://resources/sub/b.txt",
+    ]
+    assert converted_paths == raw_paths
 
 
 # ── _tree_original tests ──

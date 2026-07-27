@@ -931,6 +931,7 @@ class VikingFS:
             if visible_limit is not None
             else None
         )
+        base_parts = self._split_path_parts(path)
 
         while True:
             raw_paths = await self._async_agfs.glob_directory(
@@ -945,9 +946,9 @@ class VikingFS:
             for entry_path in raw_paths:
                 if visible_limit is not None and len(matches) >= visible_limit:
                     break
-                if not self._is_tree_path_visible(entry_path, path, real_ctx):
-                    continue
-                matches.append(self._path_to_uri(entry_path, ctx=ctx))
+                entry_uri = self._visible_tree_path_uri(entry_path, base_parts, real_ctx)
+                if entry_uri is not None:
+                    matches.append(entry_uri)
 
             need_more = (
                 visible_limit is not None
@@ -1550,16 +1551,24 @@ class VikingFS:
 
     # ========== Tree Traversal (Refactored) ==========
 
+    @staticmethod
+    def _split_path_parts(path: str) -> List[str]:
+        return [part for part in path.strip("/").split("/") if part]
+
+    @staticmethod
+    def _is_name_visible_at_parts(name: str, path_parts: List[str], parent_len: int) -> bool:
+        if parent_len == 2 and path_parts[0] == "local":
+            return name in VikingURI.LISTABLE_SCOPES
+        return name not in STORAGE_INTERNAL_ENTRY_NAMES
+
     def _is_name_visible_at_path(self, name: str, parent_path: str) -> bool:
         """Check if name would appear in _ls_entries(parent_path).
 
         At account root (/local/{account}), uses LISTABLE_SCOPES whitelist.
         At other levels, uses the shared storage internal-name blacklist.
         """
-        parts = [p for p in parent_path.strip("/").split("/") if p]
-        if len(parts) == 2 and parts[0] == "local":
-            return name in VikingURI.LISTABLE_SCOPES
-        return name not in STORAGE_INTERNAL_ENTRY_NAMES
+        parts = self._split_path_parts(parent_path)
+        return self._is_name_visible_at_parts(name, parts, len(parts))
 
     def _ancestor_is_filtered(self, entry_path: str, base_path: str) -> bool:
         """Check if any ancestor directory of entry_path would be filtered by _ls_entries.
@@ -1567,16 +1576,32 @@ class VikingFS:
         Walks from base_path (exclusive) to entry's parent directory (exclusive),
         checking each component against _is_name_visible_at_path.
         """
-        base_parts = [p for p in base_path.strip("/").split("/") if p]
-        entry_parts = [p for p in entry_path.strip("/").split("/") if p]
+        base_parts = self._split_path_parts(base_path)
+        entry_parts = self._split_path_parts(entry_path)
 
         for i in range(len(base_parts), len(entry_parts) - 1):
             name = entry_parts[i]
-            parent_parts = entry_parts[:i]
-            parent_path = "/" + "/".join(parent_parts) if parent_parts else "/"
-            if not self._is_name_visible_at_path(name, parent_path):
+            if not self._is_name_visible_at_parts(name, entry_parts, i):
                 return True
         return False
+
+    def _visible_tree_path_uri(
+        self, entry_path: str, base_parts: List[str], ctx: RequestContext
+    ) -> Optional[str]:
+        """Return the visible Viking URI for a raw tree path, or None when filtered."""
+        entry_parts = self._split_path_parts(entry_path)
+
+        for i in range(len(base_parts), len(entry_parts) - 1):
+            if not self._is_name_visible_at_parts(entry_parts[i], entry_parts, i):
+                return None
+
+        if entry_parts and not self._is_name_visible_at_parts(
+            entry_parts[-1], entry_parts, len(entry_parts) - 1
+        ):
+            return None
+
+        uri = self._path_to_uri(entry_path, ctx=ctx)
+        return uri if self._is_accessible(uri, ctx) else None
 
     def _is_tree_entry_visible(
         self, entry: Dict[str, Any], base_path: str, ctx: RequestContext
@@ -1593,23 +1618,8 @@ class VikingFS:
 
     def _is_tree_path_visible(self, entry_path: str, base_path: str, ctx: RequestContext) -> bool:
         """Apply tree visibility and ACL checks to a filesystem path."""
-
-        if self._ancestor_is_filtered(entry_path, base_path):
-            return False
-
-        entry_parts = [p for p in entry_path.strip("/").split("/") if p]
-        if entry_parts:
-            name = entry_parts[-1]
-            parent_parts = entry_parts[:-1]
-            parent_path = "/" + "/".join(parent_parts) if parent_parts else "/"
-            if not self._is_name_visible_at_path(name, parent_path):
-                return False
-
-        uri = self._path_to_uri(entry_path, ctx=ctx)
-        if not self._is_accessible(uri, ctx):
-            return False
-
-        return True
+        base_parts = self._split_path_parts(base_path)
+        return self._visible_tree_path_uri(entry_path, base_parts, ctx) is not None
 
     # Over-fetch multiplier for bounded tree traversal. When a node_limit is
     # set, we push down node_limit * this factor as the raw-node limit to Rust,
@@ -1749,8 +1759,14 @@ class VikingFS:
             if not inner:
                 return "viking://"
             real_ctx = self._ctx_or_default(ctx)
+            account_id = real_ctx.account_id
+            if inner == account_id:
+                return "viking://"
+            account_prefix = f"{account_id}/"
+            if inner.startswith(account_prefix) and "//" not in inner:
+                return f"viking://{inner[len(account_prefix):]}"
             parts = [p for p in inner.split("/") if p]
-            if parts and parts[0] == real_ctx.account_id:
+            if parts and parts[0] == account_id:
                 parts = parts[1:]
             if not parts:
                 return "viking://"
@@ -1801,9 +1817,9 @@ class VikingFS:
 
     def _is_accessible(self, uri: str, ctx: RequestContext) -> bool:
         """Check whether a URI is visible/accessible under current request context."""
-        normalized_uri, parts = self._normalized_uri_parts(uri)
         if ctx.role == Role.ROOT:
             return True
+        normalized_uri, parts = self._normalized_uri_parts(uri)
         if not parts:
             return True
         if is_watch_task_control_uri(normalized_uri):

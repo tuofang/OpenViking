@@ -16,6 +16,7 @@ from openviking.server.dependencies import get_service
 from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
+from openviking.server.responses import success_json_response
 from openviking.server.telemetry import run_operation
 from openviking.telemetry import TelemetryRequest
 from openviking.utils.search_filters import _resolve_levels, merge_time_filter
@@ -283,4 +284,4 @@ async def glob(
         if mapped is not None:
             raise mapped from exc
         raise
-    return Response(status="ok", result=result)
+    return success_json_response(result)
