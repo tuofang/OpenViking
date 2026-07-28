@@ -22,6 +22,8 @@ use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
+const GREP_CACHE_FETCH_BATCH_SIZE: usize = 256;
+
 fn grep_cache_file_concurrency() -> usize {
     default_grep_concurrency()
 }
@@ -427,7 +429,7 @@ impl CachedFileSystem {
                 }
 
                 file_batch.push(current_path);
-                if file_batch.len() >= grep_cache_file_concurrency() {
+                if file_batch.len() >= GREP_CACHE_FETCH_BATCH_SIZE {
                     self.flush_grep_file_batch(
                         &mut file_batch,
                         &base_path,

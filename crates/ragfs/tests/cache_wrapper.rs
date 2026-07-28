@@ -730,10 +730,10 @@ async fn cached_grep_memoizes_generation_keys_within_one_traversal() {
 }
 
 #[tokio::test]
-async fn cached_grep_fetches_file_payloads_in_bounded_batches() {
+async fn cached_grep_fetches_file_payloads_in_256_key_batches() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();
-    for index in 0..40 {
+    for index in 0..300 {
         backend
             .write(
                 &format!("/docs/{index}.md"),
@@ -759,28 +759,20 @@ async fn cached_grep_fetches_file_payloads_in_bounded_batches() {
         .await
         .unwrap();
 
-    assert_eq!(result.count, 40);
+    assert_eq!(result.count, 300);
     let file_batches = provider
         .observed_batch_get_key_batches()
         .into_iter()
         .filter(|batch| batch.iter().any(|key| key.contains(":file:")))
         .collect::<Vec<_>>();
-    assert!(
-        file_batches.len() >= 2,
-        "warm cached grep should split file payload reads into bounded batches"
-    );
-    let max_file_batch = file_batches
+    let file_batch_sizes = file_batches
         .iter()
         .map(|batch| batch.iter().filter(|key| key.contains(":file:")).count())
-        .max()
-        .unwrap_or(0);
-    assert!(
-        max_file_batch > 8,
-        "cached grep should use the shared grep concurrency window instead of the old 8-file window"
-    );
-    assert!(
-        max_file_batch <= 100,
-        "cached grep file payload batch size should stay bounded by the shared grep concurrency cap"
+        .collect::<Vec<_>>();
+    assert_eq!(
+        file_batch_sizes,
+        vec![256, 44],
+        "warm cached grep should use 256-key payload batches independently of scan concurrency"
     );
 }
 
