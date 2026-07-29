@@ -88,9 +88,15 @@ impl MemStoreKvStore for FakeKvStore {
         }
     }
 
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, MemStoreStoreError> {
+    fn get(&self, key: &str) -> Result<Option<Bytes>, MemStoreStoreError> {
         let _guard = self.enter()?;
-        Ok(self.values.lock().unwrap().get(key).cloned())
+        Ok(self
+            .values
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .map(Bytes::from))
     }
 
     fn set(&self, key: &str, value: &[u8]) -> Result<(), MemStoreStoreError> {
@@ -117,14 +123,14 @@ impl MemStoreKvStore for FakeKvStore {
     fn batch_get(
         &self,
         keys: &[String],
-    ) -> Result<Vec<MemStoreItemResult<Option<Vec<u8>>>>, MemStoreStoreError> {
+    ) -> Result<Vec<MemStoreItemResult<Option<Bytes>>>, MemStoreStoreError> {
         let _guard = self.enter()?;
         self.batch_get_calls.fetch_add(1, Ordering::SeqCst);
         self.observed_batch_get.lock().unwrap().push(keys.to_vec());
         let values = self.values.lock().unwrap();
         Ok(keys
             .iter()
-            .map(|key| Ok(values.get(key).cloned()))
+            .map(|key| Ok(values.get(key).cloned().map(Bytes::from)))
             .collect())
     }
 

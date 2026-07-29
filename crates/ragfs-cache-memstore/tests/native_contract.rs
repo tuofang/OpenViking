@@ -52,6 +52,7 @@ struct FakeMemStore {
     values: HashMap<String, Vec<u8>>,
     growing_initial_read: bool,
     get_calls: Vec<Vec<(String, usize)>>,
+    get_buffers: Vec<Vec<usize>>,
     initialize_calls: usize,
     successful_initializations: usize,
     exit_calls: usize,
@@ -66,6 +67,10 @@ fn fake_store() -> &'static Mutex<FakeMemStore> {
 
 fn take_get_calls() -> Vec<Vec<(String, usize)>> {
     std::mem::take(&mut fake_store().lock().unwrap().get_calls)
+}
+
+fn take_get_buffers() -> Vec<Vec<usize>> {
+    std::mem::take(&mut fake_store().lock().unwrap().get_buffers)
 }
 
 unsafe fn key_from_raw(key: *const c_char, key_len: u16) -> String {
@@ -163,6 +168,9 @@ unsafe extern "C" fn MmsGet(items: *mut GetItems, item_num: c_uint) -> i32 {
             .map(|item| (key_from_raw(item.key, item.key_len), item.length as usize))
             .collect(),
     );
+    store
+        .get_buffers
+        .push(items.iter().map(|item| *item.value as usize).collect());
     if items.len() == 1 {
         let key = key_from_raw(items[0].key, items[0].key_len);
         if key == SENTINEL_KEY {
@@ -350,6 +358,17 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
         .unwrap();
     first.put(EMPTY_KEY, Bytes::new()).await.unwrap();
     take_get_calls();
+    take_get_buffers();
+    let first_small = first.get(SMALL_KEY).await.unwrap().unwrap();
+    let first_buffer = take_get_buffers()[0][0];
+    assert_eq!(first_small.as_ptr() as usize, first_buffer + 9);
+    drop(first_small);
+    let second_small = first.get(SMALL_KEY).await.unwrap().unwrap();
+    let second_buffer = take_get_buffers()[0][0];
+    assert_eq!(second_small.as_ptr() as usize, second_buffer + 9);
+    assert_eq!(second_buffer, first_buffer);
+    drop(second_small);
+    take_get_calls();
     assert_eq!(
         first
             .batch_get(&[SMALL_KEY.into(), LARGE_KEY.into()])
@@ -369,6 +388,13 @@ async fn native_reads_resize_delete_retries_sentinels_and_runtime_leases_work() 
             ],
             vec![(LARGE_KEY.into(), 9 + LARGE_PAYLOAD_SIZE)],
         ]
+    );
+    let batch_buffers = take_get_buffers();
+    assert_eq!(batch_buffers.len(), 2);
+    assert_eq!(batch_buffers[0].len(), 2);
+    assert_eq!(
+        batch_buffers[0][1] - batch_buffers[0][0],
+        INITIAL_READ_BUFFER_SIZE
     );
 
     assert_eq!(

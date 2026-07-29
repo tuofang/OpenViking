@@ -1,7 +1,9 @@
 #![cfg_attr(not(feature = "memstore-native"), allow(dead_code))]
 
 use crate::MemStoreStoreError;
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
+use std::ops::Range;
 
 pub(crate) const HEADER_LEN: usize = 9;
 const MAGIC: &[u8; 4] = b"OVMS";
@@ -55,18 +57,20 @@ pub(crate) fn encode_value(
     Ok(framed)
 }
 
+#[cfg(test)]
 pub(crate) fn decode_value(
     framed: &[u8],
     max_payload_size: usize,
 ) -> Result<Vec<u8>, MemStoreStoreError> {
-    let payload_len = payload_len(framed, max_payload_size)?;
-    let logical_len = HEADER_LEN.checked_add(payload_len).ok_or_else(|| {
-        MemStoreStoreError::InvalidData("MemStore value frame length overflowed".into())
-    })?;
-    if framed.len() < logical_len {
-        return invalid_data("MemStore value frame payload is truncated");
-    }
-    Ok(framed[HEADER_LEN..logical_len].to_vec())
+    Ok(framed[payload_range(framed, max_payload_size)?].to_vec())
+}
+
+pub(crate) fn decode_owned_value(
+    framed: Bytes,
+    max_payload_size: usize,
+) -> Result<Bytes, MemStoreStoreError> {
+    let range = payload_range(&framed, max_payload_size)?;
+    Ok(framed.slice(range))
 }
 
 pub(crate) fn payload_len(
@@ -95,6 +99,20 @@ pub(crate) fn payload_len(
     Ok(payload_len)
 }
 
+fn payload_range(
+    framed: &[u8],
+    max_payload_size: usize,
+) -> Result<Range<usize>, MemStoreStoreError> {
+    let payload_len = payload_len(framed, max_payload_size)?;
+    let logical_len = HEADER_LEN.checked_add(payload_len).ok_or_else(|| {
+        MemStoreStoreError::InvalidData("MemStore value frame length overflowed".into())
+    })?;
+    if framed.len() < logical_len {
+        return invalid_data("MemStore value frame payload is truncated");
+    }
+    Ok(HEADER_LEN..logical_len)
+}
+
 fn invalid_data<T>(message: impl Into<String>) -> Result<T, MemStoreStoreError> {
     Err(MemStoreStoreError::InvalidData(message.into()))
 }
@@ -103,6 +121,7 @@ fn invalid_data<T>(message: impl Into<String>) -> Result<T, MemStoreStoreError> 
 mod tests {
     use super::*;
     use crate::MemStoreStoreError;
+    use bytes::Bytes;
 
     #[test]
     fn direct_and_hashed_keys_match_the_memstore_mapping() {
@@ -152,6 +171,17 @@ mod tests {
             decode_value(b"OVMS\x01\x00\x00\x00\x03newstale", 16).unwrap(),
             b"new"
         );
+    }
+
+    #[test]
+    fn owned_decode_slices_payload_without_copying() {
+        let framed = Bytes::from(encode_value(b"payload", 16).unwrap());
+        let payload_ptr = unsafe { framed.as_ptr().add(HEADER_LEN) };
+
+        let decoded = decode_owned_value(framed, 16).unwrap();
+
+        assert_eq!(decoded, Bytes::from_static(b"payload"));
+        assert_eq!(decoded.as_ptr(), payload_ptr);
     }
 
     #[test]

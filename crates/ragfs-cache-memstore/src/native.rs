@@ -1,10 +1,13 @@
 use crate::client::map_store_error;
-use crate::frame::{decode_value, encode_value, native_key, payload_len, HEADER_LEN};
+use crate::frame::{decode_owned_value, encode_value, native_key, payload_len, HEADER_LEN};
+use crate::read_buffer::ReadBufferPool;
 use crate::{
     MemStoreConfig, MemStoreItemResult, MemStoreKvStore, MemStoreProvider, MemStoreStoreError,
 };
+use bytes::Bytes;
 use ragfs::cache::{CacheError, CacheResult};
 use ragfs_cache_memstore_sys as sys;
+use std::cell::RefCell;
 use std::ffi::{c_char, c_uint};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,6 +18,8 @@ const INITIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
 const DIRECTORY_READ_BUFFER_SIZE: usize = 32 * 1024;
 const MAX_READ_BATCH_SIZE: usize = 256;
 const MAX_RESIZE_ATTEMPTS: usize = 3;
+const MAX_POOLED_READ_BUFFER_CAPACITY: usize = MAX_READ_BATCH_SIZE * DIRECTORY_READ_BUFFER_SIZE;
+const MAX_POOLED_READ_TOTAL_CAPACITY: usize = 64 * 1024 * 1024;
 
 static SERVICEABLE: AtomicBool = AtomicBool::new(false);
 static RUNTIME: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
@@ -63,11 +68,12 @@ enum RuntimeState {
 
 struct NativeMemStore {
     max_value_size: usize,
+    read_buffers: Arc<ReadBufferPool>,
     released: AtomicBool,
 }
 
 struct RawRead {
-    buffer: Vec<u8>,
+    buffer: Bytes,
     caller_buffer_preserved: bool,
     real_length: usize,
     result: i32,
@@ -79,6 +85,83 @@ struct PendingRead {
     resize_attempts: usize,
 }
 
+#[derive(Default)]
+struct RawGetScratch {
+    offsets: Vec<usize>,
+    returned_ptrs: Vec<*mut c_char>,
+    real_lengths: Vec<u32>,
+    results: Vec<i32>,
+    items: Vec<sys::GetItems>,
+}
+
+thread_local! {
+    static RAW_GET_SCRATCH: RefCell<RawGetScratch> = RefCell::new(RawGetScratch::default());
+}
+
+impl RawGetScratch {
+    fn prepare(
+        &mut self,
+        keys: &[String],
+        buffer_sizes: &[usize],
+        buffer: &mut [u8],
+    ) -> Result<(), MemStoreStoreError> {
+        self.clear();
+        self.offsets.reserve(keys.len());
+        self.returned_ptrs.reserve(keys.len());
+        self.real_lengths.resize(keys.len(), 0);
+        self.results.resize(keys.len(), RESULT_SENTINEL);
+        self.items.reserve(keys.len());
+
+        let buffer_base = buffer.as_mut_ptr();
+        let mut offset = 0usize;
+        for size in buffer_sizes {
+            u32::try_from(*size).map_err(|_| {
+                MemStoreStoreError::InvalidArgument(
+                    "MemStore read buffer size exceeds c_uint::MAX".into(),
+                )
+            })?;
+            let next_offset = offset.checked_add(*size).ok_or_else(|| {
+                MemStoreStoreError::InvalidArgument("MemStore read batch size overflowed".into())
+            })?;
+            if next_offset > buffer.len() {
+                return Err(MemStoreStoreError::InvalidArgument(
+                    "MemStore read buffers exceed the contiguous allocation".into(),
+                ));
+            }
+            self.offsets.push(offset);
+            let header_end = offset + HEADER_LEN.min(*size);
+            buffer[offset..header_end].fill(0);
+            self.returned_ptrs
+                .push(unsafe { buffer_base.add(offset) }.cast::<c_char>());
+            offset = next_offset;
+        }
+
+        let returned_ptrs_base = self.returned_ptrs.as_mut_ptr();
+        let real_lengths_base = self.real_lengths.as_mut_ptr();
+        let results_base = self.results.as_mut_ptr();
+        for (index, key) in keys.iter().enumerate() {
+            self.items.push(sys::GetItems {
+                key: key.as_ptr().cast(),
+                key_len: key.len() as u16,
+                offset: 0,
+                length: buffer_sizes[index] as u32,
+                value: unsafe { returned_ptrs_base.add(index) },
+                real_length: unsafe { real_lengths_base.add(index) },
+                result: unsafe { results_base.add(index) },
+            });
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.results.clear();
+        self.real_lengths.clear();
+        self.returned_ptrs.clear();
+        self.offsets.clear();
+    }
+}
+
 unsafe extern "C" fn service_callback(serviceable: u8) {
     SERVICEABLE.store(serviceable != 0, Ordering::Release);
 }
@@ -88,6 +171,11 @@ impl NativeMemStore {
         acquire_runtime(config)?;
         Ok(Self {
             max_value_size: config.max_value_size_bytes,
+            read_buffers: Arc::new(ReadBufferPool::new(
+                config.sdk_concurrency.saturating_mul(2).max(1),
+                MAX_POOLED_READ_TOTAL_CAPACITY,
+                MAX_POOLED_READ_BUFFER_CAPACITY,
+            )),
             released: AtomicBool::new(false),
         })
     }
@@ -105,7 +193,7 @@ impl NativeMemStore {
 
     fn probe_exists(&self, key: &str) -> Result<bool, MemStoreStoreError> {
         let key = native_key(key)?;
-        let (overall, mut reads) = Self::raw_get(&[key], &[HEADER_LEN])?;
+        let (overall, mut reads) = self.raw_get(&[key], &[HEADER_LEN])?;
         let read = reads.pop().ok_or_else(|| {
             MemStoreStoreError::Internal("MemStore existence probe returned no item".into())
         })?;
@@ -123,6 +211,7 @@ impl NativeMemStore {
     }
 
     fn raw_get(
+        &self,
         keys: &[String],
         buffer_sizes: &[usize],
     ) -> Result<(i32, Vec<RawRead>), MemStoreStoreError> {
@@ -140,60 +229,49 @@ impl NativeMemStore {
             return Ok((sys::RET_MMS_OK, Vec::new()));
         }
 
-        let mut buffers = buffer_sizes
-            .iter()
-            .map(|size| vec![0_u8; *size])
-            .collect::<Vec<_>>();
-        let caller_ptrs = buffers
-            .iter_mut()
-            .map(|buffer| buffer.as_mut_ptr().cast::<c_char>())
-            .collect::<Vec<_>>();
-        let mut returned_ptrs = caller_ptrs.clone();
-        let mut real_lengths = vec![0_u32; keys.len()];
-        let mut results = vec![RESULT_SENTINEL; keys.len()];
-        let returned_ptrs_base = returned_ptrs.as_mut_ptr();
-        let real_lengths_base = real_lengths.as_mut_ptr();
-        let results_base = results.as_mut_ptr();
-        let mut items = keys
-            .iter()
-            .zip(buffer_sizes)
-            .enumerate()
-            .map(|(index, (key, buffer_size))| sys::GetItems {
-                key: key.as_ptr().cast(),
-                key_len: key.len() as u16,
-                offset: 0,
-                length: *buffer_size as u32,
-                value: unsafe { returned_ptrs_base.add(index) },
-                real_length: unsafe { real_lengths_base.add(index) },
-                result: unsafe { results_base.add(index) },
+        let total_size = buffer_sizes.iter().try_fold(0usize, |total, size| {
+            total.checked_add(*size).ok_or_else(|| {
+                MemStoreStoreError::InvalidArgument("MemStore read batch size overflowed".into())
             })
-            .collect::<Vec<_>>();
+        })?;
+        let mut buffer = self.read_buffers.take(total_size);
 
-        let overall = unsafe { sys::MmsGet(items.as_mut_ptr(), items.len() as c_uint) };
-        let reads = buffers
-            .into_iter()
-            .enumerate()
-            .map(|(index, buffer)| RawRead {
-                buffer,
-                caller_buffer_preserved: returned_ptrs[index] == caller_ptrs[index],
-                real_length: real_lengths[index] as usize,
-                result: results[index],
-            })
-            .collect();
-        Ok((overall, reads))
+        RAW_GET_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.prepare(keys, buffer_sizes, &mut buffer)?;
+            let overall =
+                unsafe { sys::MmsGet(scratch.items.as_mut_ptr(), scratch.items.len() as c_uint) };
+            let buffer = buffer.into_bytes();
+            let reads = (0..keys.len())
+                .map(|index| {
+                    let start = scratch.offsets[index];
+                    let end = start + buffer_sizes[index];
+                    let caller_ptr = unsafe { buffer.as_ptr().add(start) }.cast::<c_char>();
+                    RawRead {
+                        buffer: buffer.slice(start..end),
+                        caller_buffer_preserved: scratch.returned_ptrs[index]
+                            == caller_ptr.cast_mut(),
+                        real_length: scratch.real_lengths[index] as usize,
+                        result: scratch.results[index],
+                    }
+                })
+                .collect();
+            scratch.clear();
+            Ok((overall, reads))
+        })
     }
 
     fn read_results(
         &self,
         keys: &[String],
-    ) -> Result<Vec<MemStoreItemResult<Option<Vec<u8>>>>, MemStoreStoreError> {
+    ) -> Result<Vec<MemStoreItemResult<Option<Bytes>>>, MemStoreStoreError> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
         let native_keys = Self::native_keys(keys)?;
         let mut outcomes = std::iter::repeat_with(|| None)
             .take(keys.len())
-            .collect::<Vec<Option<MemStoreItemResult<Option<Vec<u8>>>>>>();
+            .collect::<Vec<Option<MemStoreItemResult<Option<Bytes>>>>>();
         let max_frame_size = HEADER_LEN + self.max_value_size;
         let mut pending = (0..native_keys.len())
             .map(|index| PendingRead {
@@ -215,7 +293,7 @@ impl NativeMemStore {
                     .iter()
                     .map(|item| item.buffer_size)
                     .collect::<Vec<_>>();
-                let (overall, reads) = Self::raw_get(&call_keys, &call_sizes)?;
+                let (overall, reads) = self.raw_get(&call_keys, &call_sizes)?;
 
                 for (item, read) in chunk.iter().zip(reads) {
                     match effective_result(read.result, overall, "get") {
@@ -255,8 +333,9 @@ impl NativeMemStore {
                                         )));
                                 }
                             } else {
-                                outcomes[item.index] =
-                                    Some(decode_value(&read.buffer, self.max_value_size).map(Some));
+                                outcomes[item.index] = Some(
+                                    decode_owned_value(read.buffer, self.max_value_size).map(Some),
+                                );
                             }
                         }
                         Ok(code) => {
@@ -387,7 +466,7 @@ impl Drop for NativeMemStore {
 impl MemStoreKvStore for NativeMemStore {
     fn health_check(&self) -> Result<(), MemStoreStoreError> {
         let key = native_key(HEALTH_KEY)?;
-        let (overall, mut reads) = Self::raw_get(&[key], &[HEADER_LEN])?;
+        let (overall, mut reads) = self.raw_get(&[key], &[HEADER_LEN])?;
         let read = reads.pop().ok_or_else(|| {
             MemStoreStoreError::Internal("MemStore health read returned no item".into())
         })?;
@@ -402,7 +481,7 @@ impl MemStoreKvStore for NativeMemStore {
         }
     }
 
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, MemStoreStoreError> {
+    fn get(&self, key: &str) -> Result<Option<Bytes>, MemStoreStoreError> {
         self.read_results(&[key.to_owned()])?
             .pop()
             .ok_or_else(|| MemStoreStoreError::Internal("MemStore get returned no item".into()))?
@@ -431,7 +510,7 @@ impl MemStoreKvStore for NativeMemStore {
     fn batch_get(
         &self,
         keys: &[String],
-    ) -> Result<Vec<MemStoreItemResult<Option<Vec<u8>>>>, MemStoreStoreError> {
+    ) -> Result<Vec<MemStoreItemResult<Option<Bytes>>>, MemStoreStoreError> {
         self.read_results(keys)
     }
 
@@ -622,5 +701,53 @@ fn map_native_status(code: i32, operation: &str) -> MemStoreStoreError {
         | sys::RET_MMS_MISS
         | sys::RET_MMS_OK => MemStoreStoreError::Internal(detail),
         _ => MemStoreStoreError::Internal(detail),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_get_scratch_reuses_ffi_metadata_allocations() {
+        let keys = vec!["first".to_owned(), "second".to_owned()];
+        let buffer_sizes = vec![INITIAL_READ_BUFFER_SIZE; keys.len()];
+        let mut buffer = vec![0x5a_u8; buffer_sizes.iter().sum()];
+        let mut scratch = RawGetScratch::default();
+
+        scratch.prepare(&keys, &buffer_sizes, &mut buffer).unwrap();
+        for offset in [0, INITIAL_READ_BUFFER_SIZE] {
+            assert_eq!(&buffer[offset..offset + HEADER_LEN], &[0; HEADER_LEN]);
+            assert!(
+                buffer[offset + HEADER_LEN..offset + INITIAL_READ_BUFFER_SIZE]
+                    .iter()
+                    .all(|byte| *byte == 0x5a)
+            );
+        }
+        let allocations = (
+            scratch.offsets.as_ptr(),
+            scratch.returned_ptrs.as_ptr(),
+            scratch.real_lengths.as_ptr(),
+            scratch.results.as_ptr(),
+            scratch.items.as_ptr(),
+        );
+        assert_eq!(scratch.offsets, vec![0, INITIAL_READ_BUFFER_SIZE]);
+        assert_eq!(scratch.returned_ptrs[0].cast::<u8>(), buffer.as_mut_ptr());
+        assert_eq!(scratch.returned_ptrs[1].cast::<u8>(), unsafe {
+            buffer.as_mut_ptr().add(INITIAL_READ_BUFFER_SIZE)
+        });
+
+        scratch.prepare(&keys, &buffer_sizes, &mut buffer).unwrap();
+
+        assert_eq!(
+            (
+                scratch.offsets.as_ptr(),
+                scratch.returned_ptrs.as_ptr(),
+                scratch.real_lengths.as_ptr(),
+                scratch.results.as_ptr(),
+                scratch.items.as_ptr(),
+            ),
+            allocations
+        );
     }
 }

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use ragfs::cache::{
     CacheNamespace, CachePolicy, CacheProvider, CacheTraversalMode, CachedFileSystem,
 };
@@ -36,9 +37,15 @@ impl MemStoreKvStore for SharedKvStore {
         self.check()
     }
 
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, MemStoreStoreError> {
+    fn get(&self, key: &str) -> Result<Option<Bytes>, MemStoreStoreError> {
         self.check()?;
-        Ok(self.values.lock().unwrap().get(key).cloned())
+        Ok(self
+            .values
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .map(Bytes::from))
     }
 
     fn set(&self, key: &str, value: &[u8]) -> Result<(), MemStoreStoreError> {
@@ -64,13 +71,13 @@ impl MemStoreKvStore for SharedKvStore {
     fn batch_get(
         &self,
         keys: &[String],
-    ) -> Result<Vec<MemStoreItemResult<Option<Vec<u8>>>>, MemStoreStoreError> {
+    ) -> Result<Vec<MemStoreItemResult<Option<Bytes>>>, MemStoreStoreError> {
         self.check()?;
         self.batch_get_calls.fetch_add(1, Ordering::SeqCst);
         let values = self.values.lock().unwrap();
         Ok(keys
             .iter()
-            .map(|key| Ok(values.get(key).cloned()))
+            .map(|key| Ok(values.get(key).cloned().map(Bytes::from)))
             .collect())
     }
 

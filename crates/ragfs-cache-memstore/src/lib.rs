@@ -5,6 +5,8 @@ mod frame;
 #[cfg(feature = "memstore-native")]
 mod native;
 mod provider;
+#[cfg(any(feature = "memstore-native", test))]
+mod read_buffer;
 mod store;
 
 pub use config::MemStoreConfig;

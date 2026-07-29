@@ -1,5 +1,6 @@
 use crate::frame::validate_key;
 use crate::{MemStoreItemResult, MemStoreKvStore, MemStoreStoreError};
+use bytes::Bytes;
 use ragfs::cache::{CacheError, CacheResult};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -129,7 +130,7 @@ impl MemStoreClient {
             .await
     }
 
-    pub(crate) async fn get(&self, key: &str) -> CacheResult<Option<Vec<u8>>> {
+    pub(crate) async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
         validate_key(key).map_err(map_store_error)?;
         let key = key.to_owned();
         self.execute("get", move |store| store.get(&key)).await
@@ -161,7 +162,7 @@ impl MemStoreClient {
     pub(crate) async fn batch_get(
         &self,
         keys: &[String],
-    ) -> CacheResult<Vec<MemStoreItemResult<Option<Vec<u8>>>>> {
+    ) -> CacheResult<Vec<MemStoreItemResult<Option<Bytes>>>> {
         for key in keys {
             validate_key(key).map_err(map_store_error)?;
         }

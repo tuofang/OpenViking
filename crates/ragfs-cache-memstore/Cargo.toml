@@ -8,7 +8,7 @@ description = "MemStore cache provider adapter for RAGFS"
 
 [dependencies]
 async-trait = "0.1"
-bytes = "1.5"
+bytes = "1.9"
 libc = "0.2"
 ragfs = { path = "../ragfs", features = ["cache"] }
 ragfs-cache-memstore-sys = { path = "../ragfs-cache-memstore-sys", optional = true }

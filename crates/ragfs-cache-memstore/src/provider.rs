@@ -174,7 +174,7 @@ impl CacheProvider for MemStoreProvider {
     }
 
     async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        Ok(self.client.get(key).await?.map(Bytes::from))
+        self.client.get(key).await
     }
 
     async fn put(&self, key: &str, value: Bytes) -> CacheResult<()> {
@@ -210,11 +210,7 @@ impl CacheProvider for MemStoreProvider {
             .batch_get(keys)
             .await?
             .into_iter()
-            .map(|result| {
-                result
-                    .map(|value| value.map(Bytes::from))
-                    .map_err(map_store_error)
-            })
+            .map(|result| result.map_err(map_store_error))
             .collect()
     }
 
@@ -336,8 +332,14 @@ mod tests {
             Ok(())
         }
 
-        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, MemStoreStoreError> {
-            Ok(self.values.lock().unwrap().get(key).cloned())
+        fn get(&self, key: &str) -> Result<Option<Bytes>, MemStoreStoreError> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .map(Bytes::from))
         }
 
         fn set(&self, key: &str, value: &[u8]) -> Result<(), MemStoreStoreError> {
@@ -360,11 +362,11 @@ mod tests {
         fn batch_get(
             &self,
             keys: &[String],
-        ) -> Result<Vec<MemStoreItemResult<Option<Vec<u8>>>>, MemStoreStoreError> {
+        ) -> Result<Vec<MemStoreItemResult<Option<Bytes>>>, MemStoreStoreError> {
             let values = self.values.lock().unwrap();
             Ok(keys
                 .iter()
-                .map(|key| Ok(values.get(key).cloned()))
+                .map(|key| Ok(values.get(key).cloned().map(Bytes::from)))
                 .collect())
         }
 
